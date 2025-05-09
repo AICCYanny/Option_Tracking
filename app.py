@@ -2,13 +2,16 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-# from dotenv import load_dotenv
 import time
 import gzip
 import io
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime, timedelta
+
+if os.getenv("RUNNING_IN_STREAMLIT_CLOUD") != "1":
+    from dotenv import load_dotenv
+    load_dotenv()
 
 # --- 环境变量加载 ---
 # load_dotenv()
