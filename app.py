@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 import time
 import gzip
 import io
@@ -11,7 +11,7 @@ import numpy as np
 from datetime import datetime, timedelta
 
 # --- 环境变量加载 ---
-load_dotenv()
+# load_dotenv()
 default_key = os.getenv("IVOL_API_KEY", "")
 
 
