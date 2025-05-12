@@ -252,7 +252,9 @@ if page == "📈 获取单个期权 IV 数据（Intraday）":
 
         with st.spinner("正在请求数据..."):
             res = requests.get(url, params=params)
-            if res.status_code != 200:
+            if res.status_code == 204:
+                st.info("数据未准备好，请稍后再试。")
+            elif res.status_code != 200:
                 st.error(f"请求失败，状态码：{res.status_code}")
             else:
                 data = res.json()
