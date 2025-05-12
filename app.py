@@ -78,7 +78,8 @@ def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key, sessi
 def detect_abnormal_trades(raw_df,
                            win=3,
                            rel_thresh=5.0,
-                           notional_thresh_k=5000):
+                           notional_thresh_k=5000,
+                           vol_gt_oi=False):
     """
     条件：
         • 名义金额 = volume × mid_price × 100  ≥ notional_thresh_k * 1_000
@@ -99,20 +100,22 @@ def detect_abnormal_trades(raw_df,
         # bid / ask
         "Bid": "Bid", "bid": "Bid", "Ask": "Ask", "ask": "Ask",
         # trade date
-        "tradeDate": "tradeDate", "c_date": "tradeDate"
+        "tradeDate": "tradeDate", "c_date": "tradeDate",
+        # open interest
+        "openinterest": "OI", "OI": "OI", "openInterest": "OI"
     }
     df = raw_df.rename(columns={c: rename_map.get(c, c) for c in raw_df.columns})
     df = df.loc[:, ~df.columns.duplicated()]  # 去重列
 
     # ---------- 2. 字段检查 ----------
-    need = {"cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate"}
+    need = {"cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate", "OI"}
     if not need.issubset(df.columns):
         missing = ", ".join(need - set(df.columns))
         st.warning(f"⚠️ 缺少字段：{missing}，无法计算名义金额")
         return pd.DataFrame()
 
     # ---------- 3. 基础清洗 ----------
-    df = df[["cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate"]].copy()
+    df = df[["cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate", "OI"]].copy()
     df["tradeDate"] = pd.to_datetime(df["tradeDate"])
     df[["volume", "Bid", "Ask"]] = df[["volume", "Bid", "Ask"]].apply(
         pd.to_numeric, errors="coerce").fillna(0)
@@ -121,16 +124,24 @@ def detect_abnormal_trades(raw_df,
     df["mid"]      = (df["Bid"] + df["Ask"]) / 2
     df["notional"] = df["volume"] * df["mid"] * 100   # 美股期权乘数 100
 
+    # 加入OI
+    if vol_gt_oi:
+        need.add("OI")  # 启用时必须检测列存在
+
     # ---------- 4. 分组计算 ----------
     out = []
     for _, g in df.groupby(["cp", "strike", "expiry"]):
         g = g.sort_values("tradeDate")
         g["roll_mean"] = g["volume"].shift(1).rolling(win, min_periods=1).mean()
         g["rel"] = g["volume"] / g["roll_mean"].replace(0, np.nan)
-        g["abnormal"] = (
+        cond = (
             (g["notional"] >= notional_thresh_k * 1_000) &
             (g["rel"] >= rel_thresh)
         )
+        if vol_gt_oi:
+            cond &= g["volume"] > g["OI"]           # 追加 Volume > OI
+        g["abnormal"] = cond
+
         out.append(g)
 
     return pd.concat(out, ignore_index=True)
@@ -155,54 +166,54 @@ def fetch_eod(option_symbol: str, api_key: str) -> pd.DataFrame:
 
 
 def show_contract_chart(option_symbol: str, api_key: str) -> None:
-    """画出合约过去 3 个月 Volume + Mid（price）"""
+    """显示合约过去 3 个月成交量 + Mid 价图，并附 EOD 数据表"""
     df = fetch_eod(option_symbol, api_key)
     if df.empty:
-        st.warning("未获取到数据")
+        st.warning("未获取到任何 EOD 数据")
         return
 
-    # -------- 列名统一 -------- #
-    rename_map = {
+    # —— 列名统一 —— #
+    df = df.rename(columns={
         "price": "price", "Price": "price", "mid": "price",
         "volume": "volume", "Volume": "volume"
-    }
-    df = df.rename(columns={c: rename_map.get(c, c) for c in df.columns})
-
+    })
     if {"price", "volume", "date"}.issubset(df.columns) is False:
-        st.warning("回包缺少 price / volume / date 列，无法绘图")
+        st.warning("EOD 数据缺少必要列（price / volume / date）")
         return
 
-    # -------- 数据清洗 -------- #
+    # —— 清洗 —— #
     df["price"]  = pd.to_numeric(df["price"],  errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["date"]   = pd.to_datetime(df["date"],  errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
 
-    # -------- 绘图 -------- #
-    import matplotlib.pyplot as plt
+    # —— 图表 —— #
     fig, ax1 = plt.subplots(figsize=(10, 6))
-
-    # Volume 柱状
     ax1.bar(df["date"], df["volume"], width=0.6, label="Volume")
     ax1.set_ylabel("Volume")
     ax1.tick_params(axis="x", rotation=45)
 
-    # Mid-price 折线（黄色）
     ax2 = ax1.twinx()
     ax2.plot(df["date"], df["price"],
              color="#FFC107", marker="o", label="Mid Price ($)")
     ax2.set_ylabel("Mid Price ($)")
-
-    # 标题 + 图例
-    plt.title(f"{option_symbol} | Past 3-Month Volume & Mid")
+    plt.title(f"{option_symbol}  |  Past 3-Month Volume & Mid Price")
     lines, labels   = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax2.legend(lines + lines2, labels + labels2, loc="upper left")
-
     fig.tight_layout()
-    plt.grid(True, which="both", axis="x",
-             linestyle="--", alpha=0.3)
+    plt.grid(True, which="both", axis="x", linestyle="--", alpha=0.3)
     st.pyplot(fig)
+
+    # —— 数据表 & 下载 —— #
+    st.subheader("🔍 原始 EOD 数据")
+    st.dataframe(df)
+    st.download_button(
+        "📥 下载该合约 3-月 EOD 数据 CSV",
+        df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{option_symbol}_eod.csv",
+        mime="text/csv",
+    )
 
 
 
@@ -261,7 +272,7 @@ elif page == "🔍 获取期权集合（按 DTE + Moneyness/Delta）":
     st.title("🔍 获取期权集合")
 
     symbol = st.text_input("股票代码")
-    trade_date = st.date_input("交易日期 (YYYY-MM-DD)", value="2021-12-16")
+    trade_date = st.date_input("交易日期 (YYYY-MM-DD)")
     dte_from = st.number_input("最小 DTE", value=0)
     dte_to = st.number_input("最大 DTE", value=30)
     call_put = st.selectbox("Call / Put", ["C", "P"])
@@ -374,11 +385,11 @@ elif page == "🗓️ 获取期权历史 EOD 数据":
     else:
         col1, col2 = st.columns(2)
         with col1:
-            ticker = st.text_input("股票代码 (Ticker)", value="SPX")
-            expiry = st.date_input("到期日", value=pd.to_datetime("2025-12-19"))
+            ticker = st.text_input("股票代码 (Ticker)")
+            expiry = st.date_input("到期日")
         with col2:
             call_put = st.selectbox("Call / Put", ["C", "P"])
-            strike = st.number_input("执行价", value=4100.0)
+            strike = st.number_input("执行价")
 
         # 自动拼接 OCC optionSymbol
         option_symbol = construct_option_symbol(
@@ -388,9 +399,9 @@ elif page == "🗓️ 获取期权历史 EOD 数据":
 
     col_from, col_to = st.columns(2)
     with col_from:
-        from_date = st.date_input("起始日期 (from_)", value=pd.to_datetime("2022-09-29"))
+        from_date = st.date_input("起始日期 (from_)")
     with col_to:
-        to_date = st.date_input("结束日期 (to)", value=pd.to_datetime("2022-10-30"))
+        to_date = st.date_input("结束日期 (to)")
 
     api_key = st.text_input("API Key", type="password", value=default_key, key="eod_api")
 
@@ -490,6 +501,7 @@ elif page == "📊 异常期权交易监测":
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
         rel_slider  = st.slider("量比阈值", 1.5, 10.0, 5.0, 0.1)
         notional_k  = st.number_input("名义金额阈值 (千美元)", 500, 50000, 500, step=100)
+        vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
 
     # ② 基本输入
     symbol  = st.text_input("股票代码（如 AAPL）")
@@ -531,7 +543,8 @@ elif page == "📊 异常期权交易监测":
             raw_df,
             win=win_slider,
             rel_thresh=rel_slider,
-            notional_thresh_k=notional_k
+            notional_thresh_k=notional_k,
+            vol_gt_oi=vol_gt_oi
         )
 
         # 4.2 全量结果
@@ -557,6 +570,38 @@ elif page == "📊 异常期权交易监测":
                 file_name="abnormal_records.csv",
                 mime="text/csv",
             )
+
+                # ---------- NEW PART · 当日异常合约 ----------
+            # 1) 先保证有 option_symbol 列（沿用你之前的拼接逻辑）
+            if "option_symbol" not in abnormal_df.columns:
+                ticker_fixed = symbol.upper().ljust(6)              # 单一 ticker
+                abnormal_df["option_symbol"] = (
+                    ticker_fixed +
+                    pd.to_datetime(abnormal_df["expiry"]).dt.strftime("%y%m%d") +
+                    abnormal_df["cp"] +
+                    (abnormal_df["strike"] * 1000).round()
+                        .astype(int).astype(str).str.zfill(8)
+                )
+
+            # 2) 找到最后一个交易日
+            last_trade_day = abnormal_df["tradeDate"].max()
+
+            # 3) 过滤出该日 abnormal=True 的记录
+            last_day_df = abnormal_df[abnormal_df["tradeDate"] == last_trade_day]
+            unique_last_opts = sorted(last_day_df["option_symbol"].unique())
+
+            st.subheader(f"📌 {last_trade_day:%Y-%m-%d} 当日异常合约")
+            if unique_last_opts:
+                st.dataframe(pd.DataFrame({"option_symbol": unique_last_opts}))
+                st.download_button(
+                    "📥 下载当日异常合约清单",
+                    "\n".join(unique_last_opts).encode("utf-8"),
+                    file_name=f"abn_opts_{last_trade_day:%Y%m%d}.txt",
+                    mime="text/plain",
+                )
+
+            else:
+                st.info("最后一个交易日未检测到异常合约")
 
             # ---------- STEP-3: 异常合约清单 + 单合约图 ----------
             if not abnormal_df.empty:
