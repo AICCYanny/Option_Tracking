@@ -8,6 +8,7 @@ import io
 import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime, timedelta
+from datetime import date
 
 if os.getenv("RUNNING_IN_STREAMLIT_CLOUD") != "1":
     from dotenv import load_dotenv
@@ -516,6 +517,7 @@ elif page == "📊 异常期权交易监测":
 
     # ① 侧边栏 · Volume 参数
     with st.sidebar.expander("⚙️ Volume / Notional 筛选参数", expanded=False):
+        base_date = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯 15 个工作日）", value=date.today())
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
         rel_slider  = st.slider("量比阈值", 1.5, 10.0, 5.0, 0.1)
         notional_k  = st.number_input("名义金额阈值 (千美元)", 500, 50000, 500, step=100)
@@ -528,14 +530,13 @@ elif page == "📊 异常期权交易监测":
 
     # ③ STEP-1: 下载 / 刷新数据（只做一次）
     if st.button("📡 下载最近 15 个交易日数据") and symbol and api_key:
-        today     = datetime.today().date()
-        workdays  = get_workdays(today, 15)
+        workdays  = get_workdays(base_date, 15)
         cps       = ("C", "P") if scan_cp.startswith("同时") else ("C",) if "Call" in scan_cp else ("P",)
         session   = requests.Session()
         all_rows  = []
 
         for trade_date in reversed(workdays):
-            dte_offset = (today - trade_date.date()).days
+            dte_offset = (base_date - trade_date.date()).days
             for cp in cps:
                 st.write(f"⏳ {trade_date:%Y-%m-%d} {cp}  DTE=[{dte_offset},{300+dte_offset}]")
                 df_day = fetch_option_data_for_day(symbol, trade_date,
