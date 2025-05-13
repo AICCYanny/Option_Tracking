@@ -102,20 +102,36 @@ def detect_abnormal_trades(raw_df,
         # trade date
         "tradeDate": "tradeDate", "c_date": "tradeDate",
         # open interest
-        "openinterest": "OI", "OI": "OI", "openInterest": "OI"
+        "openinterest": "OI", "OI": "OI", "openInterest": "OI",
+        # implied volatility
+        "iv": "iv", "IV": "iv", "ImpliedVol": "iv",
+        # delta
+        "delta": "delta", "Delta": "delta",
+        # gamma
+        "gamma": "gamma", "Gamma": "gamma",
+        # vega
+        "vega":  "vega",  "Vega":  "vega",
+        # theta
+        "theta": "theta", "Theta": "theta",
+        # rho
+        "rho":   "rho",   "Rho":   "rho"
     }
     df = raw_df.rename(columns={c: rename_map.get(c, c) for c in raw_df.columns})
     df = df.loc[:, ~df.columns.duplicated()]  # 去重列
 
     # ---------- 2. 字段检查 ----------
-    need = {"cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate", "OI"}
-    if not need.issubset(df.columns):
-        missing = ", ".join(need - set(df.columns))
-        st.warning(f"⚠️ 缺少字段：{missing}，无法计算名义金额")
+    base_need = {"cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate"}
+    if vol_gt_oi:
+        base_need.add("OI")
+    if not base_need.issubset(df.columns):
+        st.warning("缺少关键列，无法筛选异常")
         return pd.DataFrame()
+    
+    keep_cols = list(base_need) + ["iv", "delta", "gamma", "vega", "theta", "rho"]
+    keep_cols = [c for c in keep_cols if c in df.columns]  # greeks 可能缺
 
     # ---------- 3. 基础清洗 ----------
-    df = df[["cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate", "OI"]].copy()
+    df = df[keep_cols].copy()
     df["tradeDate"] = pd.to_datetime(df["tradeDate"])
     df[["volume", "Bid", "Ask"]] = df[["volume", "Bid", "Ask"]].apply(
         pd.to_numeric, errors="coerce").fillna(0)
@@ -126,7 +142,7 @@ def detect_abnormal_trades(raw_df,
 
     # 加入OI
     if vol_gt_oi:
-        need.add("OI")  # 启用时必须检测列存在
+        base_need.add("OI")  # 启用时必须检测列存在
 
     # ---------- 4. 分组计算 ----------
     out = []
@@ -560,7 +576,7 @@ elif page == "📊 异常期权交易监测":
         )
 
         # 4.3 仅异常
-        abnormal_df = result_df[result_df["abnormal"]]
+        abnormal_df = result_df[result_df["abnormal"]].copy()
         st.subheader("🚨 异常记录 (abnormal == True)")
         if abnormal_df.empty:
             st.info("本次参数设置下未检测到异常记录。")
@@ -576,31 +592,66 @@ elif page == "📊 异常期权交易监测":
                 # ---------- NEW PART · 当日异常合约 ----------
             # 1) 先保证有 option_symbol 列（沿用你之前的拼接逻辑）
             if "option_symbol" not in abnormal_df.columns:
-                ticker_fixed = symbol.upper().ljust(6)              # 单一 ticker
+                ticker_fixed = symbol.upper().ljust(6)
                 abnormal_df["option_symbol"] = (
                     ticker_fixed +
                     pd.to_datetime(abnormal_df["expiry"]).dt.strftime("%y%m%d") +
                     abnormal_df["cp"] +
-                    (abnormal_df["strike"] * 1000).round()
-                        .astype(int).astype(str).str.zfill(8)
+                    (abnormal_df["strike"]*1000).round().astype(int).astype(str).str.zfill(8)
                 )
 
-            # 2) 找到最后一个交易日
-            last_trade_day = abnormal_df["tradeDate"].max()
+            # 2) 过滤出最后一个交易日
+            last_day  = abnormal_df["tradeDate"].max()
+            last_df   = abnormal_df[abnormal_df["tradeDate"] == last_day]
+
+            call_df   = last_df[last_df["cp"] == "C"]
+            put_df    = last_df[last_df["cp"] == "P"]
+
+            st.subheader(f"📌 {last_day:%Y-%m-%d} 当日异常合约")
+
+            c1, c2 = st.columns(2)
+
+            # ----- Call 表 + 下载 -----
+            with c1:
+                st.markdown("### 📘 Call")
+                if call_df.empty:
+                    st.info("该日无 Call 异常")
+                else:
+                    st.dataframe(call_df)
+                    st.download_button("下载 Call CSV",
+                        call_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"call_abn_{last_day:%Y%m%d}.csv")
+            # ----- Put 表 + 下载 -----
+            with c2:
+                st.markdown("### 📕 Put")
+                if put_df.empty:
+                    st.info("该日无 Put 异常")
+                else:
+                    st.dataframe(put_df)
+                    st.download_button("下载 Put CSV",
+                        put_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"put_abn_{last_day:%Y%m%d}.csv")
 
             # 3) 过滤出该日 abnormal=True 的记录
-            last_day_df = abnormal_df[abnormal_df["tradeDate"] == last_trade_day]
-            unique_last_opts = sorted(last_day_df["option_symbol"].unique())
+            if not call_df.empty or not put_df.empty:
+                c3, c4 = st.columns(2)
+                with c3:
+                    sel_call = st.selectbox("选择 Call 合约查看走势",
+                                            sorted(call_df["option_symbol"].unique()),
+                                            key="sel_call")
+                with c4:
+                    sel_put  = st.selectbox("选择 Put 合约查看走势",
+                                            sorted(put_df["option_symbol"].unique()),
+                                            key="sel_put")
 
-            st.subheader(f"📌 {last_trade_day:%Y-%m-%d} 当日异常合约")
-            if unique_last_opts:
-                st.dataframe(pd.DataFrame({"option_symbol": unique_last_opts}))
-                st.download_button(
-                    "📥 下载当日异常合约清单",
-                    "\n".join(unique_last_opts).encode("utf-8"),
-                    file_name=f"abn_opts_{last_trade_day:%Y%m%d}.txt",
-                    mime="text/plain",
-                )
+                if st.button("📊 同时查看两条合约走势图"):
+                    colL, colR = st.columns(2)
+                    with colL:
+                        st.markdown(f"#### Call {sel_call}")
+                        show_contract_chart(sel_call, api_key)
+                    with colR:
+                        st.markdown(f"#### Put {sel_put}")
+                        show_contract_chart(sel_put, api_key)
 
             else:
                 st.info("最后一个交易日未检测到异常合约")
@@ -630,7 +681,78 @@ elif page == "📊 异常期权交易监测":
                 if st.button("📊 查看合约走势图"):
                     show_contract_chart(sel_opt, api_key)
 
+            # ---------- STEP-4 · 异常记录的 Volume-Weighted Payoff ----------
+        if not abnormal_df.empty:
+
+            abnormal_df["expiry"]    = pd.to_datetime(abnormal_df["expiry"],    errors="coerce")
+            abnormal_df["tradeDate"] = pd.to_datetime(abnormal_df["tradeDate"], errors="coerce")
+
+
+            # 基础列已经在前面 copy 并拼接 option_symbol，这里只需确保必要列存在
+            payoff_need = {"cp", "strike", "expiry", "tradeDate", "volume", "mid"}
+            if not payoff_need.issubset(abnormal_df.columns):
+                st.warning("异常表缺少绘制 Payoff 所需列")
+            else:
+                # 1️⃣ 选择到期日 & 交易日（仅限异常记录）
+                payoff_exp_opts = sorted(abnormal_df["expiry"].dt.date.unique())
+                st.subheader("🎯 Payoff（仅异常合约）")
+                sel_exp = st.selectbox("选择到期日", payoff_exp_opts, key="payoff_exp")
+
+                df_exp = abnormal_df[abnormal_df["expiry"].dt.date == sel_exp]
+                payoff_td_opts = sorted(df_exp["tradeDate"].dt.date.unique())
+                sel_td = st.selectbox("选择交易日", payoff_td_opts, key="payoff_td")
+
+                df_pay = df_exp[df_exp["tradeDate"].dt.date == sel_td]
+
+                if st.button("📊 绘制异常合约 Payoff", key="payoff_btn"):
+
+                    # 1️⃣ 底层价格区间
+                    k_min, k_max = df_pay["strike"].min(), df_pay["strike"].max()
+                    S = np.linspace(0.5 * k_min, 1.5 * k_max, 400)
+
+                    # 2️⃣ 逐合约加权求和
+                    payoff_sum, premium_sum = np.zeros_like(S), 0.0
+                    total_vol = df_pay["volume"].sum()
+
+                    for _, row in df_pay.iterrows():
+                        vol, K = row["volume"], row["strike"]
+                        premium = row["mid"]
+                        intrinsic = np.maximum(S - K, 0) if row["cp"] == "C" else np.maximum(K - S, 0)
+                        payoff_sum  += vol * intrinsic
+                        premium_sum += vol * premium
+
+                    if total_vol == 0:
+                        st.warning("Volume 总和为 0，无法归一化")
+                        st.stop()
+
+                    net_payoff = (payoff_sum / total_vol) - (premium_sum / total_vol)
+
+                    # --- 绘图 ---
+                    fig, ax = plt.subplots(figsize=(8, 5))
+                    ax.plot(S, net_payoff, label="Net Payoff (Intrinsic − Premium)")
+                    ax.axhline(0, color="black", lw=0.8)
+                    ax.set_xlabel("Underlying Price at Expiry")
+                    ax.set_ylabel("Avg Net Payoff per Contract ($)")
+                    ax.set_title(f"Net Payoff | Exp {sel_exp} | Trade {sel_td}")
+                    ax.grid(alpha=0.3)
+                    ax.legend()
+                    st.pyplot(fig)
+
+                    # 5️⃣ 明细表 & 下载（保持不变）
+                    st.markdown("##### 用于计算的异常合约明细")
+                    st.dataframe(df_pay)
+                    st.download_button(
+                        "📥 下载该批异常合约",
+                        df_pay.to_csv(index=False).encode("utf-8"),
+                        file_name=f"abn_payoff_{sel_exp}_{sel_td}.csv",
+                        mime="text/csv",
+                    )
+        else:
+            st.info("当前参数下无异常记录，无法绘制 Payoff")
+
+
 
 
     else:
         st.info("👉 请输入 Ticker 和 API Key，然后点击 “📡 下载…” 按钮先拉取数据。")
+
