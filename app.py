@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from datetime import datetime, timedelta
 from datetime import date
+import zipfile
 
 if os.getenv("RUNNING_IN_STREAMLIT_CLOUD") != "1":
     from dotenv import load_dotenv
@@ -17,7 +18,6 @@ if os.getenv("RUNNING_IN_STREAMLIT_CLOUD") != "1":
 # --- 环境变量加载 ---
 # load_dotenv()
 default_key = os.getenv("IVOL_API_KEY", "")
-
 
 @st.cache_data(ttl=86400, show_spinner=False)
 
@@ -163,7 +163,7 @@ def detect_abnormal_trades(raw_df,
 
     return pd.concat(out, ignore_index=True)
 
-def fetch_eod(option_symbol: str, api_key: str) -> pd.DataFrame:
+def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
     """
     拉取单个 option_symbol 过去 3 个月日线 EOD 数据，缓存 24 h
     """
@@ -176,9 +176,17 @@ def fetch_eod(option_symbol: str, api_key: str) -> pd.DataFrame:
         "from": start.strftime("%Y-%m-%d"),
         "to":   end.strftime("%Y-%m-%d")
     }
-    res = requests.get(url, params=params).json()
-    if isinstance(res.get("data"), list) and res["data"]:
-        return pd.DataFrame(res["data"])
+    for _ in range(retry):
+        try:
+            res = requests.get(url, params=params, timeout=10)
+            if not res.ok:
+                time.sleep(1.5)
+                continue
+            return pd.DataFrame(res.json().get("data", []))
+        except (requests.RequestException, json.JSONDecodeError):
+            time.sleep(1.5)
+            continue
+    # 所有重试都失败，返回空表
     return pd.DataFrame()
 
 
@@ -204,11 +212,25 @@ def show_contract_chart(option_symbol: str, api_key: str) -> None:
     df["date"]   = pd.to_datetime(df["date"],  errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
 
+    n_min = 2
+    n_max = 30
+
+    if len(df) >= 2:
+        # 基于数据点数量调整柱宽
+        n = len(df)
+        # 限制在 [n_min, n_max] 之间
+        n = min(max(n, n_min), n_max)
+        # 线性插值：越多数据越接近0.6，越少数据越接近0.2
+        bar_width = 0.2 + (n - n_min) / (n_max - n_min) * (0.6 - 0.2)
+    else:
+        bar_width = 0.2
+
     # —— 图表 —— #
     fig, ax1 = plt.subplots(figsize=(10, 6))
-    ax1.bar(df["date"], df["volume"], width=0.6, label="Volume")
+    ax1.bar(df["date"], df["volume"], width=bar_width, label="Volume")
     ax1.set_ylabel("Volume")
-    ax1.tick_params(axis="x", rotation=45)
+    ax1.tick_params(axis="x", rotation=45)                              
+    ax1.margins(x=0.15)        # 左右各再留 15% 空白；想更窄就调 0.10~0.05
 
     ax2 = ax1.twinx()
     ax2.plot(df["date"], df["price"],
@@ -232,7 +254,92 @@ def show_contract_chart(option_symbol: str, api_key: str) -> None:
         mime="text/csv",
     )
 
+def figs_to_zip(figs: dict[str, "plt.Figure"]) -> bytes:
+    """把 {'name': Figure, ...} 打包成 ZIP → bytes"""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, fig in figs.items():
+            img = io.BytesIO()
+            fig.savefig(img, format="png", dpi=150, bbox_inches="tight")
+            zf.writestr(f"{name}.png", img.getvalue())
+    return buf.getvalue()
 
+def build_price_volume_figure(df: pd.DataFrame, option_symbol: str) -> "plt.Figure":
+
+    n_min = 2
+    n_max = 30
+
+    if len(df) >= 2:
+        # 基于数据点数量调整柱宽
+        n = len(df)
+        # 限制在 [n_min, n_max] 之间
+        n = min(max(n, n_min), n_max)
+        # 线性插值：越多数据越接近0.6，越少数据越接近0.2
+        bar_width = 0.2 + (n - n_min) / (n_max - n_min) * (0.6 - 0.2)
+    else:
+        bar_width = 0.2
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.bar(df["date"], df["volume"], width=bar_width, label="Volume")
+    ax1.set_ylabel("Volume")
+    ax1.tick_params(axis="x", rotation=45)                              
+    ax1.margins(x=0.15)        # 左右各再留 15% 空白；想更窄就调 0.10~0.05
+
+    ax2 = ax1.twinx()
+    ax2.plot(df["date"], df["price"],
+             color="#FFC107", marker="o", label="Mid Price ($)")
+    ax2.set_ylabel("Mid Price ($)")
+    plt.title(f"{option_symbol}  |  Past 3-Month Volume & Mid Price")
+    lines, labels   = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax2.legend(lines + lines2, labels + labels2, loc="upper left")
+    fig.tight_layout()
+    return fig
+
+def generate_contract_chart(option_symbol: str, api_key: str) -> "plt.Figure":
+    """复用 fetch_eod()，但只返回 fig，方便批量保存"""
+    df = fetch_eod(option_symbol, api_key)
+    if df.empty:
+        return None
+
+    df = df.rename(columns={
+        "price": "price", "Price": "price", "mid": "price",
+        "volume": "volume", "Volume": "volume"
+    })
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df.dropna(subset=["date", "price"], inplace=True)
+
+    return build_price_volume_figure(df, option_symbol=option_symbol)
+
+def draw_payoff(df_pay: pd.DataFrame, expiry: str, trade_date: str) -> "plt.Figure":
+    """
+    df_pay : 同一到期日、同一交易日的异常合约集合
+             必须含 strike, volume, mid, cp 列
+    """
+    k_min, k_max = df_pay["strike"].min(), df_pay["strike"].max()
+    S = np.linspace(0.5 * k_min, 1.5 * k_max, 400)
+
+    payoff_sum, premium_sum = np.zeros_like(S), 0.0
+    total_vol = df_pay["volume"].sum()
+
+    for _, row in df_pay.iterrows():
+        vol, K, prem = row["volume"], row["strike"], row["mid"]
+        intrinsic = np.maximum(S - K, 0) if row["cp"] == "C" else np.maximum(K - S, 0)
+        payoff_sum  += vol * intrinsic
+        premium_sum += vol * prem
+
+    net_payoff = (payoff_sum / total_vol) - (premium_sum / total_vol)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(S, net_payoff, label="Net Payoff (Intrinsic − Premium)")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_xlabel("Underlying Price at Expiry")
+    ax.set_ylabel("Avg Net Payoff per Contract ($)")
+    ax.set_title(f"Net Payoff | Exp {expiry} | Trade {trade_date}")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    return fig
 
 
 # --- 页面选择 ---
@@ -520,7 +627,7 @@ elif page == "📊 异常期权交易监测":
         base_date = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯 15 个工作日）", value=date.today())
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
         rel_slider  = st.slider("量比阈值", 1.5, 10.0, 5.0, 0.1)
-        notional_k  = st.number_input("名义金额阈值 (千美元)", 500, 50000, 500, step=100)
+        notional_k  = st.number_input("名义金额阈值 (千美元)", 100, 50000, 500, step=100)
         vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
 
     # ② 基本输入
@@ -657,6 +764,53 @@ elif page == "📊 异常期权交易监测":
             else:
                 st.info("最后一个交易日未检测到异常合约")
 
+            # ========== 页面 4 —— 新增：批量绘制 & 下载 ==========
+            # --------------------------------------------------
+            if not call_df.empty or not put_df.empty:
+                st.markdown("#### 🔄 批量绘制并下载当日异常合约走势图")
+                if st.button("🚀 生成全部图表"):
+                    call_figs, put_figs = {}, {}
+                    fail_call, fail_put = [], []
+                    total = len(call_df) + len(put_df)
+                    prog = st.progress(0)
+                    
+                    for i, opt in enumerate(call_df["option_symbol"]):
+                        fig = generate_contract_chart(opt, api_key)
+                        if fig is not None:
+                            call_figs[opt] = fig
+                        else:
+                            fail_call.append(opt)
+                        prog.progress((i + 1) / total)
+                    for j, opt in enumerate(put_df["option_symbol"], start=len(call_df)):
+                        fig = generate_contract_chart(opt, api_key)
+                        if fig is not None:
+                            put_figs[opt] = fig
+                        else:
+                            fail_put.append(opt)
+                        prog.progress((j + 1) / total)
+                    prog.empty()
+                    st.session_state["call_figs_today"] = call_figs
+                    st.session_state["put_figs_today"]  = put_figs
+
+                    if fail_call or fail_put:
+                        st.warning(f"抓取失败：Call {len(fail_call)} 张, Put {len(fail_put)} 张")
+
+                today_str = last_day.strftime("%Y%m%d")
+                if "call_figs_today" in st.session_state and st.session_state["call_figs_today"]:
+                    st.download_button(
+                        f"📥 下载 {today_str} 全部 Call 图 (ZIP)",
+                        figs_to_zip(st.session_state["call_figs_today"]),
+                        file_name=f"{today_str}_calls.zip",
+                        mime="application/zip"
+                    )
+                if "put_figs_today" in st.session_state and st.session_state["put_figs_today"]:
+                    st.download_button(
+                        f"📥 下载 {today_str} 全部 Put 图 (ZIP)",
+                        figs_to_zip(st.session_state["put_figs_today"]),
+                        file_name=f"{today_str}_puts.zip",
+                        mime="application/zip"
+                    )
+
             # ---------- STEP-3: 异常合约清单 + 单合约图 ----------
             if not abnormal_df.empty:
 
@@ -688,6 +842,28 @@ elif page == "📊 异常期权交易监测":
             abnormal_df["expiry"]    = pd.to_datetime(abnormal_df["expiry"],    errors="coerce")
             abnormal_df["tradeDate"] = pd.to_datetime(abnormal_df["tradeDate"], errors="coerce")
 
+            st.markdown("### 💹 一键下载指定交易日的所有到期日 Payoff")
+            available_dates = sorted(abnormal_df["tradeDate"].unique(), reverse=True)
+            trade_date_sel  = st.selectbox("选择交易日", available_dates, format_func=lambda d: d.strftime("%Y-%m-%d"))
+
+            if st.button("🚀 生成并下载该日所有 Payoff 图"):
+                rows_td = abnormal_df[abnormal_df["tradeDate"] == trade_date_sel]
+                payoff_figs = {}
+                prog = st.progress(0)
+                exps = rows_td["expiry"].unique()
+                for k, exp in enumerate(exps):
+                    df_one = rows_td[rows_td["expiry"] == exp]
+                    fig = draw_payoff(df_one, exp, trade_date_sel.strftime("%Y-%m-%d"))
+                    payoff_figs[f"{exp}"] = fig
+                    prog.progress((k + 1) / len(exps))
+                prog.empty()
+                st.download_button(
+                    f"📥 下载 {trade_date_sel:%Y%m%d} 所有到期日 Payoff (ZIP)",
+                    figs_to_zip(payoff_figs),
+                    file_name=f"{trade_date_sel:%Y%m%d}_payoffs.zip",
+                    mime="application/zip"
+                )
+
 
             # 基础列已经在前面 copy 并拼接 option_symbol，这里只需确保必要列存在
             payoff_need = {"cp", "strike", "expiry", "tradeDate", "volume", "mid"}
@@ -707,36 +883,7 @@ elif page == "📊 异常期权交易监测":
 
                 if st.button("📊 绘制异常合约 Payoff", key="payoff_btn"):
 
-                    # 1️⃣ 底层价格区间
-                    k_min, k_max = df_pay["strike"].min(), df_pay["strike"].max()
-                    S = np.linspace(0.5 * k_min, 1.5 * k_max, 400)
-
-                    # 2️⃣ 逐合约加权求和
-                    payoff_sum, premium_sum = np.zeros_like(S), 0.0
-                    total_vol = df_pay["volume"].sum()
-
-                    for _, row in df_pay.iterrows():
-                        vol, K = row["volume"], row["strike"]
-                        premium = row["mid"]
-                        intrinsic = np.maximum(S - K, 0) if row["cp"] == "C" else np.maximum(K - S, 0)
-                        payoff_sum  += vol * intrinsic
-                        premium_sum += vol * premium
-
-                    if total_vol == 0:
-                        st.warning("Volume 总和为 0，无法归一化")
-                        st.stop()
-
-                    net_payoff = (payoff_sum / total_vol) - (premium_sum / total_vol)
-
-                    # --- 绘图 ---
-                    fig, ax = plt.subplots(figsize=(8, 5))
-                    ax.plot(S, net_payoff, label="Net Payoff (Intrinsic − Premium)")
-                    ax.axhline(0, color="black", lw=0.8)
-                    ax.set_xlabel("Underlying Price at Expiry")
-                    ax.set_ylabel("Avg Net Payoff per Contract ($)")
-                    ax.set_title(f"Net Payoff | Exp {sel_exp} | Trade {sel_td}")
-                    ax.grid(alpha=0.3)
-                    ax.legend()
+                    fig = draw_payoff(df_pay, sel_exp, sel_td)
                     st.pyplot(fig)
 
                     # 5️⃣ 明细表 & 下载（保持不变）
