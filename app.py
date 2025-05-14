@@ -211,7 +211,27 @@ def show_contract_chart(option_symbol: str, api_key: str) -> None:
     df["price"]  = pd.to_numeric(df["price"],  errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     df["date"]   = pd.to_datetime(df["date"],  errors="coerce")
+
+    # ① 先保证日期排序正确
     df = df.dropna(subset=["date"]).sort_values("date")
+
+    # ② 需要计算环比百分变的列
+    greek_cols = ["delta", "gamma", "vega", "theta", "rho"]
+
+    # ③ 对每个列使用 pct_change，乘 100 得到百分数
+    for col in greek_cols:
+        if col in df.columns:
+            df[f"{col}_pct"] = df[col].pct_change() * 100
+        else:
+            # 若接口该列缺失，给出 NaN 占位，便于后续统一处理
+            df[f"{col}_pct"] = np.nan
+
+    # ④ 可选：把首行 NaN 或 inf 替换成 0，并保留两位小数
+    df[[f"{c}_pct" for c in greek_cols]] = (
+        df[[f"{c}_pct" for c in greek_cols]]
+        .replace([np.inf, -np.inf], np.nan)
+        .round(2)
+    )
 
     n_min = 2
     n_max = 30
