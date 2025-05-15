@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import requests
+from functools import lru_cache
+from cachetools import TTLCache, cached
 import os
 import time
 import gzip
@@ -22,6 +24,12 @@ default_key = os.getenv("IVOL_API_KEY", "")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 
+@st.cache_resource(show_spinner=False)          # Streamlit 会把它当作单例
+def get_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": "OptionTracking/1.0"})
+    return s
+
 # --- OCC optionSymbol 构造 ---
 def construct_option_symbol(ticker: str, expiry: str, call_put: str, strike: float) -> str:
     ticker_formatted = ticker.upper().ljust(6)
@@ -35,8 +43,9 @@ def get_workdays(end_date: str | datetime, days: int = 15):
     workdays = pd.bdate_range(end=date, periods=days)   # ← 不再减一天
     return workdays
 
-def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key, session):
+def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key):
     """返回指定日期 + cp （C/P）的 DataFrame；429 时自动指数回退"""
+    session = get_session()
     url = "https://restapi.ivolatility.com/equities/eod/stock-opts-by-param"
     params = {
         "apiKey": api_key,
@@ -52,7 +61,7 @@ def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key, sessi
 
     backoff = 2          # 秒
     while True:
-        res = session.get(url, params=params)
+        res = session.get(url, params=params, timeout=10)
         if res.status_code == 429:
             time.sleep(backoff)
             backoff = min(backoff * 2, 32)   # 指数回退，封顶 32s
@@ -168,6 +177,7 @@ def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
     """
     拉取单个 option_symbol 过去 3 个月日线 EOD 数据，缓存 24 h
     """
+    session = get_session()
     end   = datetime.today().date()
     start = end - timedelta(days=90)
     url   = "https://restapi.ivolatility.com/equities/eod/single-stock-option-raw-iv"
@@ -179,7 +189,7 @@ def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
     }
     for _ in range(retry):
         try:
-            res = requests.get(url, params=params, timeout=10)
+            res = session.get(url, params=params, timeout=10)
             if not res.ok:
                 time.sleep(1.5)
                 continue
@@ -190,10 +200,18 @@ def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
     # 所有重试都失败，返回空表
     return pd.DataFrame()
 
+# ① 先建一个 1 小时 TTL 的缓存容器
+_eod_cache = TTLCache(maxsize=4000, ttl=3600)   # 4 k key，够用了
+
+# ② 用 cached 装饰器包一层
+@cached(_eod_cache)
+def fetch_eod_cached(option_symbol: str, api_key: str) -> pd.DataFrame:
+    return fetch_eod(option_symbol, api_key)    # 这里调用你现有的 fetch_eod
+
 
 def show_contract_chart(option_symbol: str, api_key: str) -> None:
     """显示合约过去 3 个月成交量 + Mid 价图，并附 EOD 数据表"""
-    df = fetch_eod(option_symbol, api_key)
+    df = fetch_eod_cached(option_symbol, api_key)
     if df.empty:
         st.warning("未获取到任何 EOD 数据")
         return
@@ -319,7 +337,7 @@ def build_price_volume_figure(df: pd.DataFrame, option_symbol: str) -> "plt.Figu
 
 def generate_contract_chart(option_symbol: str, api_key: str) -> "plt.Figure":
     """复用 fetch_eod()，但只返回 fig，方便批量保存"""
-    df = fetch_eod(option_symbol, api_key)
+    df = fetch_eod_cached(option_symbol, api_key)
     if df.empty:
         return None
 
@@ -668,7 +686,7 @@ elif page == "📊 异常期权交易监测":
             for cp in cps:
                 st.write(f"⏳ {trade_date:%Y-%m-%d} {cp}  DTE=[{dte_offset},{300+dte_offset}]")
                 df_day = fetch_option_data_for_day(symbol, trade_date,
-                                                   dte_offset, cp, api_key, session)
+                                                   dte_offset, cp, api_key)
                 time.sleep(1.1)        # QPS <= 1
                 if df_day is not None and not df_day.empty:
                     df_day["tradeDate"] = trade_date
