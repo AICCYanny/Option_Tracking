@@ -173,12 +173,15 @@ def detect_abnormal_trades(raw_df,
 
     return pd.concat(out, ignore_index=True)
 
-def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
+def fetch_eod(option_symbol: str,
+              api_key: str,
+              retry: int = 3,
+              cutoff_date: date | None = None) -> pd.DataFrame:
     """
     拉取单个 option_symbol 过去 3 个月日线 EOD 数据，缓存 24 h
     """
     session = get_session()
-    end   = datetime.today().date()
+    end = datetime.today().date() if cutoff_date is None else cutoff_date
     start = end - timedelta(days=90)
     url   = "https://restapi.ivolatility.com/equities/eod/single-stock-option-raw-iv"
     params = {
@@ -193,7 +196,13 @@ def fetch_eod(option_symbol: str, api_key: str, retry: int = 3) -> pd.DataFrame:
             if not res.ok:
                 time.sleep(1.5)
                 continue
-            return pd.DataFrame(res.json().get("data", []))
+            df = pd.DataFrame(res.json().get("data", []))
+           
+            if cutoff_date and "date" in df.columns:
+                mask = pd.to_datetime(df["date"], errors="coerce") <= pd.Timestamp(cutoff_date)
+                df = df[mask]
+
+            return df
         except (requests.RequestException, json.JSONDecodeError):
             time.sleep(1.5)
             continue
@@ -205,13 +214,16 @@ _eod_cache = TTLCache(maxsize=4000, ttl=3600)   # 4 k key，够用了
 
 # ② 用 cached 装饰器包一层
 @cached(_eod_cache)
-def fetch_eod_cached(option_symbol: str, api_key: str) -> pd.DataFrame:
-    return fetch_eod(option_symbol, api_key)    # 这里调用你现有的 fetch_eod
+def fetch_eod_cached(
+    option_symbol: str,
+    api_key: str,
+    cutoff_date: date | None = None  # ← 新增
+) -> pd.DataFrame:
+    return fetch_eod(option_symbol, api_key, cutoff_date=cutoff_date)
 
-
-def show_contract_chart(option_symbol: str, api_key: str) -> None:
+def show_contract_chart(option_symbol: str, api_key: str, cutoff_date: date | None = None) -> None:
     """显示合约过去 3 个月成交量 + Mid 价图，并附 EOD 数据表"""
-    df = fetch_eod_cached(option_symbol, api_key)
+    df = fetch_eod_cached(option_symbol, api_key, cutoff_date=cutoff_date)
     if df.empty:
         st.warning("未获取到任何 EOD 数据")
         return
@@ -335,9 +347,9 @@ def build_price_volume_figure(df: pd.DataFrame, option_symbol: str) -> "plt.Figu
     fig.tight_layout()
     return fig
 
-def generate_contract_chart(option_symbol: str, api_key: str) -> "plt.Figure":
+def generate_contract_chart(option_symbol: str, api_key: str, cutoff_date: date) -> "plt.Figure":
     """复用 fetch_eod()，但只返回 fig，方便批量保存"""
-    df = fetch_eod_cached(option_symbol, api_key)
+    df = fetch_eod_cached(option_symbol, api_key, cutoff_date=cutoff_date)
     if df.empty:
         return None
 
@@ -795,10 +807,10 @@ elif page == "📊 异常期权交易监测":
                     colL, colR = st.columns(2)
                     with colL:
                         st.markdown(f"#### Call {sel_call}")
-                        show_contract_chart(sel_call, api_key)
+                        show_contract_chart(sel_call, api_key, cutoff_date=last_day)
                     with colR:
                         st.markdown(f"#### Put {sel_put}")
-                        show_contract_chart(sel_put, api_key)
+                        show_contract_chart(sel_put, api_key, cutoff_date=last_day)
 
             else:
                 st.info("最后一个交易日未检测到异常合约")
@@ -814,14 +826,14 @@ elif page == "📊 异常期权交易监测":
                     prog = st.progress(0)
                     
                     for i, opt in enumerate(call_df["option_symbol"]):
-                        fig = generate_contract_chart(opt, api_key)
+                        fig = generate_contract_chart(opt, api_key, cutoff_date=last_day)
                         if fig is not None:
                             call_figs[opt] = fig
                         else:
                             fail_call.append(opt)
                         prog.progress((i + 1) / total)
                     for j, opt in enumerate(put_df["option_symbol"], start=len(call_df)):
-                        fig = generate_contract_chart(opt, api_key)
+                        fig = generate_contract_chart(opt, api_key, cutoff_date=last_day)
                         if fig is not None:
                             put_figs[opt] = fig
                         else:
@@ -873,7 +885,7 @@ elif page == "📊 异常期权交易监测":
                 sel_opt = st.selectbox("选择合约查看过去 3 个月走势", unique_opts)
 
                 if st.button("📊 查看合约走势图"):
-                    show_contract_chart(sel_opt, api_key)
+                    show_contract_chart(sel_opt, api_key, cutoff_date=last_day)
 
             # ---------- STEP-4 · 异常记录的 Volume-Weighted Payoff ----------
         if not abnormal_df.empty:
