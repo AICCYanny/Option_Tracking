@@ -681,6 +681,12 @@ elif page == "📊 异常期权交易监测":
         notional_k  = st.number_input("名义金额阈值 (千美元)", 100, 50000, 500, step=100)
         vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
 
+    with st.sidebar.expander("⚙️ 高级设置 / 工具", expanded=False):
+        if st.button("♻️ 重新开始（清空缓存）"):
+            st.cache_data.clear()        # 清空 @st.cache_data/@st.cache_resource
+            st.cache_resource.clear()
+            st.session_state.clear()     # 清空会话级变量
+
     # ② 基本输入
     symbol  = st.text_input("股票代码（如 AAPL）")
     api_key = st.text_input("API Key", type="password", value=default_key)
