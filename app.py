@@ -40,7 +40,7 @@ def construct_option_symbol(ticker: str, expiry: str, call_put: str, strike: flo
 def get_workdays(end_date: str | datetime, days: int = 15):
     """返回向前回溯的最近 N 个工作日（含 end_date 当天）"""
     date = pd.to_datetime(end_date)
-    workdays = pd.bdate_range(end=date, periods=days)   # ← 不再减一天
+    workdays = pd.bdate_range(end=date, periods=days) 
     return workdays
 
 def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key):
@@ -683,9 +683,10 @@ elif page == "📊 异常期权交易监测":
 
     # ① 侧边栏 · Volume 参数
     with st.sidebar.expander("⚙️ Volume / Notional 筛选参数", expanded=False):
-        base_date = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯 15 个工作日）", value=date.today())
+        base_date = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯选定数量个工作日（默认15））", value=date.today())
+        lookback_days = st.number_input("回溯工作日天数", min_value=1, max_value=252, value=15, step=1)
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
-        rel_slider  = st.slider("量比阈值", 1.5, 10.0, 5.0, 0.1)
+        rel_slider  = st.slider("量比阈值", 1.5, 10.0, 3.0, 0.1)
         notional_k  = st.number_input("名义金额阈值 (千美元)", 100, 50000, 500, step=100)
         vol_abs_thresh = st.slider("绝对量阈值", 100, 100000, 1000, 100)
         vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
@@ -702,8 +703,8 @@ elif page == "📊 异常期权交易监测":
     scan_cp = st.radio("扫描范围", ["同时扫描 Call 与 Put", "只扫 Call", "只扫 Put"])
 
     # ③ STEP-1: 下载 / 刷新数据（只做一次）
-    if st.button("📡 下载最近 15 个交易日数据") and symbol and api_key:
-        workdays  = get_workdays(base_date, 15)
+    if st.button("📡 下载选定交易日数据") and symbol and api_key:
+        workdays  = get_workdays(base_date, lookback_days)
         cps       = ("C", "P") if scan_cp.startswith("同时") else ("C",) if "Call" in scan_cp else ("P",)
         session   = requests.Session()
         all_rows  = []
