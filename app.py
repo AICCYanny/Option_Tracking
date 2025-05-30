@@ -745,7 +745,7 @@ elif page == "📊 异常期权交易监测":
         st.download_button(
             "📥 下载全部记录 CSV",
             result_df.to_csv(index=False).encode("utf-8"),
-            file_name="all_records.csv",
+            file_name=f"{symbol}_all_records.csv",
             mime="text/csv",
         )
 
@@ -759,7 +759,7 @@ elif page == "📊 异常期权交易监测":
             st.download_button(
                 "📥 下载异常记录 CSV",
                 abnormal_df.to_csv(index=False).encode("utf-8"),
-                file_name="abnormal_records.csv",
+                file_name=f"{symbol}_abnormal_records.csv",
                 mime="text/csv",
             )
 
