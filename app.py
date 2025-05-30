@@ -88,8 +88,9 @@ def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key):
 
 def detect_abnormal_trades(raw_df,
                            win=3,
-                           rel_thresh=5.0,
+                           rel_thresh=3.0,
                            notional_thresh_k=5000,
+                           vol_abs_thresh=1000,
                            vol_gt_oi=False):
     """
     条件：
@@ -100,6 +101,8 @@ def detect_abnormal_trades(raw_df,
     """
     # ---------- 1. 列名统一 ----------
     rename_map = {
+        # underlying price
+        "underlying_price": "underlying", "spot": "underlying", "close": "underlying", 
         # cp
         "cp": "cp", "call_put": "cp", "cpFlag": "cp",
         # strike
@@ -131,7 +134,7 @@ def detect_abnormal_trades(raw_df,
     df = df.loc[:, ~df.columns.duplicated()]  # 去重列
 
     # ---------- 2. 字段检查 ----------
-    base_need = {"cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate"}
+    base_need = {"underlying", "cp", "strike", "expiry", "volume", "Bid", "Ask", "tradeDate"}
     if vol_gt_oi:
         base_need.add("OI")
     if not base_need.issubset(df.columns):
@@ -160,11 +163,16 @@ def detect_abnormal_trades(raw_df,
     for _, g in df.groupby(["cp", "strike", "expiry"]):
         g = g.sort_values("tradeDate")
         g["roll_mean"] = g["volume"].shift(1).rolling(win, min_periods=1).mean()
-        g["rel"] = g["volume"] / g["roll_mean"].replace(0, np.nan)
-        cond = (
-            (g["notional"] >= notional_thresh_k * 1_000) &
-            (g["rel"] >= rel_thresh)
-        )
+        rel = g["volume"] / g["roll_mean"].replace(0, np.nan)
+        g["rel"] = rel
+
+        notional_ok = g["notional"] >= notional_thresh_k * 1_000
+
+        cond_rel_ok     = (~rel.isna()) & (rel >= rel_thresh)
+        cond_abs_ok     = (rel.isna())  & (g["volume"] >= vol_abs_thresh)
+
+        cond = notional_ok & (cond_rel_ok | cond_abs_ok)
+
         if vol_gt_oi:
             cond &= g["volume"] > g["OI"]           # 追加 Volume > OI
         g["abnormal"] = cond
@@ -679,6 +687,7 @@ elif page == "📊 异常期权交易监测":
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
         rel_slider  = st.slider("量比阈值", 1.5, 10.0, 5.0, 0.1)
         notional_k  = st.number_input("名义金额阈值 (千美元)", 100, 50000, 500, step=100)
+        vol_abs_thresh = st.slider("绝对量阈值", 100, 100000, 1000, 100)
         vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
 
     with st.sidebar.expander("⚙️ 高级设置 / 工具", expanded=False):
