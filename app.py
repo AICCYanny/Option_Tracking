@@ -52,7 +52,7 @@ def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key):
         "symbol": symbol.upper(),
         "tradeDate": trade_date.strftime('%Y-%m-%d'),
         "dteFrom": dte_offset,
-        "dteTo": 300 + dte_offset,
+        "dteTo": 700 + dte_offset,
         "cp": cp,                       # 必须 C 或 P
         "moneynessFrom": -100,
         "moneynessTo": 100,
@@ -686,7 +686,7 @@ elif page == "📊 异常期权交易监测":
         base_date = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯选定数量个工作日（默认15））", value=date.today())
         lookback_days = st.number_input("回溯工作日天数", min_value=1, max_value=252, value=15, step=1)
         win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
-        rel_slider  = st.slider("量比阈值", 1.5, 10.0, 3.0, 0.1)
+        rel_slider  = st.slider("量比阈值", 0.5, 10.0, 3.0, 0.1)
         notional_k  = st.number_input("名义金额阈值 (千美元)", 100, 50000, 500, step=100)
         vol_abs_thresh = st.slider("绝对量阈值", 100, 100000, 1000, 100)
         vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
@@ -712,7 +712,7 @@ elif page == "📊 异常期权交易监测":
         for trade_date in reversed(workdays):
             dte_offset = (base_date - trade_date.date()).days
             for cp in cps:
-                st.write(f"⏳ {trade_date:%Y-%m-%d} {cp}  DTE=[{dte_offset},{300+dte_offset}]")
+                st.write(f"⏳ {trade_date:%Y-%m-%d} {cp}  DTE=[{dte_offset},{700+dte_offset}]")
                 df_day = fetch_option_data_for_day(symbol, trade_date,
                                                    dte_offset, cp, api_key)
                 time.sleep(1.1)        # QPS <= 1
