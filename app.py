@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from datetime import date
 import zipfile
 import json
+import yfinance as yf
+from pandas.tseries.offsets import BDay
 
 if os.getenv("RUNNING_IN_STREAMLIT_CLOUD") != "1":
     from dotenv import load_dotenv
@@ -86,6 +88,70 @@ def fetch_option_data_for_day(symbol, trade_date, dte_offset, cp, api_key):
                         return pd.read_csv(gz)
         return None
 
+def get_shares_outstanding(ticker: str) -> int | None:
+    """
+    查询某支股票的流通股本（Shares Outstanding）。
+    Parameters
+    ----------
+    ticker : str
+        股票代码（如 "AAPL"）。
+    Returns
+    -------
+    int | None
+        Shares Outstanding（股）。获取失败则返回 `None`。
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        return stock.info.get("sharesOutstanding")
+    except Exception:
+        pass
+    return None
+
+def get_adv_series(ticker: str, 
+                   n_days: int,
+                   as_of: pd.Timestamp) -> pd.DataFrame:
+    """
+    获取过去 `n_days` 个自然日的每日 30 日平均成交量（ADV）时间序列。
+    
+    Parameters
+    ----------
+    ticker : str
+        股票代码。
+    n_days : int
+        回溯天数（自然日）；建议设置为窗口长度的至少 2 倍。
+        
+    Returns
+    -------
+    pd.DataFrame
+        包含 'date' 和 'adv' 两列，前 30 行为 NaN。
+    """
+    try:
+        start = as_of - BDay(n_days * 2)  # 抓更长时间，保证够 rolling
+
+        df_px = yf.download(
+            ticker,
+            start=start,
+            end=as_of + timedelta(days=1),
+            progress=False,
+            auto_adjust=False,
+            threads=False,
+        )
+        df_px.columns = df_px.columns.droplevel(1)
+        df_px.columns.name = None
+        df_px = df_px.reset_index()
+            
+        if df_px.empty:
+            return pd.DataFrame(columns=["Date", "adv"])
+
+        df_px = df_px[["Date", "Volume"]].copy()
+        df_px["adv"] = df_px["Volume"].rolling(window=30, min_periods=30).mean()
+
+        return df_px[["Date", "adv"]].tail(n_days).reset_index(drop=True)
+
+    except Exception as e:
+        print(f"[Error] {ticker}: {e}")
+        return pd.DataFrame(columns=["Date", "adv"])
+
 def detect_abnormal_trades(raw_df,
                            win=3,
                            rel_thresh=3.0,
@@ -154,10 +220,6 @@ def detect_abnormal_trades(raw_df,
     df["mid"]      = (df["Bid"] + df["Ask"]) / 2
     df["notional"] = df["volume"] * df["mid"] * 100   # 美股期权乘数 100
 
-    # 加入OI
-    if vol_gt_oi:
-        base_need.add("OI")  # 启用时必须检测列存在
-
     # ---------- 4. 分组计算 ----------
     out = []
     for _, g in df.groupby(["cp", "strike", "expiry"]):
@@ -180,6 +242,157 @@ def detect_abnormal_trades(raw_df,
         out.append(g)
 
     return pd.concat(out, ignore_index=True)
+
+def detect_abnormal_trades_v2(
+    trades_df: pd.DataFrame,
+    *,
+    shares_out: int | None,
+    adv_series: pd.DataFrame,
+    notional_bp_thresh: float,
+    dd_adv_pct_thresh: float,
+    adv_min_thresh: float,
+    win: int = 10,
+    rel_thresh: float = 5.0,
+    vol_gt_oi: bool = True,
+) -> pd.DataFrame:
+    """
+    **新版** 异常筛选核心函数  
+    （取代旧版 `detect_abnormal_trades`，不再使用 `notional_thresh_k`）。
+
+    逻辑＝四条条件「全都满足」：
+        1. Notional / 动态市值 ≥ `notional_bp_thresh` bp
+        2. |Dollar Delta| / (ADV × Underlying) ≥ `dd_adv_pct_thresh` %
+        3. 标的 ADV ≥ `adv_min_thresh`
+        4. *滚动量比* ≥ `rel_thresh`
+           （窗口 `win`，可选附加 `vol_gt_oi` 过滤）
+
+    返回值在原字段基础上新增：
+        - dynamic_mktcap
+        - notional_pct_mktcap
+        - dollar_delta
+        - dd_pct_adv
+        - vol_roll_mean
+        - vol_ratio
+        - abnormal   （满足滚动量比条件）
+        - feature_pass  （四条全部满足 → True）
+
+    Parameters
+    ----------
+    trades_df : pd.DataFrame
+        原始期权成交记录。需至少包含：
+        ['tradeDate', 'option_symbol', 'volume', 'openInterest',
+         'delta', 'underlying', 'notional']。
+    shares_out : int | None
+        当日流通股本。若为 `None`，与动态市值相关的条件自动判 Fail。
+    adv : float | None
+        最近 30 交易日平均成交量。若为 `None`，与 ADV 相关条件自动判 Fail。
+    notional_bp_thresh : float
+        条件 (1) 阈值，单位 bp。
+    dd_adv_pct_thresh : float
+        条件 (2) 阈值，单位 %。
+    adv_min_thresh : float
+        条件 (3) 阈值，单位 股。
+    win : int
+        滚动窗口长度（交易日）。
+    rel_thresh : float
+        滚动量比阈值。
+    vol_gt_oi : bool
+        若为 True，则强制 `volume > openInterest`。
+
+    Returns
+    -------
+    pd.DataFrame
+        与输入同序 DataFrame，附带计算列与 `feature_pass` 布尔标记。
+    """
+    rename_map = {
+        # underlying price
+        "underlying_price": "underlying", "spot": "underlying", "close": "underlying", 
+        # cp
+        "cp": "cp", "call_put": "cp", "cpFlag": "cp",
+        # strike
+        "strike": "strike", "price_strike": "strike",
+        # expiry
+        "expiry": "expiry", "expiration_date": "expiry", "expirationDate": "expiry",
+        # volume
+        "volume": "volume", "totalVolume": "volume",
+        # bid / ask
+        "Bid": "Bid", "bid": "Bid", "Ask": "Ask", "ask": "Ask",
+        # mid price
+        "price": "mid",
+        # trade date
+        "tradeDate": "tradeDate", "c_date": "tradeDate",
+        # open interest
+        "openinterest": "OI", "OI": "OI", "openInterest": "OI",
+        # implied volatility
+        "iv": "iv", "IV": "iv", "ImpliedVol": "iv",
+        # delta
+        "delta": "delta", "Delta": "delta",
+        # gamma
+        "gamma": "gamma", "Gamma": "gamma",
+        # vega
+        "vega":  "vega",  "Vega":  "vega",
+        # theta
+        "theta": "theta", "Theta": "theta",
+        # rho
+        "rho":   "rho",   "Rho":   "rho"
+    }
+    raw_df = trades_df.rename(columns={c: rename_map.get(c, c) for c in trades_df.columns})
+    raw_df = raw_df.loc[:, ~raw_df.columns.duplicated()]  # 去重列
+
+
+    df = raw_df.copy()
+
+    # ===== 0) 预处理 =====
+    df["tradeDate"] = pd.to_datetime(df["tradeDate"])
+    df[["volume", "Bid", "Ask", "mid"]] = df[["volume", "Bid", "Ask", "mid"]].apply(
+        pd.to_numeric, errors="coerce").fillna(0)
+    df["notional"] = df["volume"] * df["mid"] * 100   # 美股期权乘数 100
+
+    # 映射adv
+    adv_series = adv_series.set_index('Date')['adv']
+    df['adv'] = df['tradeDate'].map(adv_series)
+
+    out = []
+    for _, g in df.groupby(["cp", "strike", "expiry"]):
+        g = g.sort_values("tradeDate")
+        g["roll_mean"] = g["volume"].shift(1).rolling(win, min_periods=1).mean()
+        rel = g["volume"] / g["roll_mean"].replace(0, np.nan)
+        g["rel"] = rel
+
+        # ===== 1) 滚动量比 (按合约维度) =====
+        cond_rel = (~rel.isna()) & (rel >= rel_thresh) & (g["volume"] >= vol_abs_thresh)
+        cond_abs = (rel.isna())  & (g["volume"] >= vol_abs_thresh)
+
+        # ===== 2) 动态市值 & Notional bp =====
+        g["dynamic_mktcap"] = shares_out * g["underlying"]
+        g["notional_pct_mktcap"] = 10_000 * g["notional"] / g["dynamic_mktcap"]
+        cond_notional_bp = g["notional_pct_mktcap"] >= notional_bp_thresh
+
+        # ===== 3) Dollar Delta / (ADV×Underlying) =====
+        g["dollar_delta"] = g["delta"].abs() * 100 * g["underlying"] * g['volume']
+        #  |DD| / (ADV × Underlying) ×100 (%)
+        g["dd_pct_adv"] = 100 * g["dollar_delta"] / (g['adv'] * g["underlying"])
+        cond_dd_adv = g["dd_pct_adv"] >= dd_adv_pct_thresh
+
+        # ===== 4) ADV 本身 =====
+        cond_adv = g['adv'] <= adv_min_thresh
+
+        # ===== 5) 最终叠加 =====
+        cond =  (
+            (cond_notional_bp & 
+            cond_dd_adv) & 
+            (cond_rel | cond_abs) &
+            cond_adv
+            )
+
+        if vol_gt_oi:
+            cond &= g["volume"] > g["OI"]           # 追加 Volume > OI
+        g["abnormal"] = cond
+
+        out.append(g)
+
+    return pd.concat(out, ignore_index=True)
+
 
 def fetch_eod(option_symbol: str,
               api_key: str,
@@ -399,6 +612,7 @@ def draw_payoff(df_pay: pd.DataFrame, expiry: str, trade_date: str) -> "plt.Figu
     ax.legend()
     fig.tight_layout()
     return fig
+    
 
 
 # --- 页面选择 ---
@@ -406,7 +620,8 @@ page = st.sidebar.selectbox("选择功能", [
     "📈 获取单个期权 IV 数据（Intraday）",
     "🔍 获取期权集合（按 DTE + Moneyness/Delta）",
     "🗓️ 获取期权历史 EOD 数据",
-    "📊 异常期权交易监测"
+    "📊 异常期权交易监测", 
+    "🆕 Page 5 | 特征筛选"
 ])
 
 # --- 页面 1: Intraday IV 数据 ---
@@ -752,6 +967,337 @@ elif page == "📊 异常期权交易监测":
 
         # 4.3 仅异常
         abnormal_df = result_df[result_df["abnormal"]].copy()
+        st.subheader("🚨 异常记录 (abnormal == True)")
+        if abnormal_df.empty:
+            st.info("本次参数设置下未检测到异常记录。")
+        else:
+            st.dataframe(abnormal_df)
+            st.download_button(
+                "📥 下载异常记录 CSV",
+                abnormal_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{symbol}_abnormal_records.csv",
+                mime="text/csv",
+            )
+
+                # ---------- NEW PART · 当日异常合约 ----------
+            # 1) 先保证有 option_symbol 列（沿用你之前的拼接逻辑）
+            if "option_symbol" not in abnormal_df.columns:
+                ticker_fixed = symbol.upper().ljust(6)
+                abnormal_df["option_symbol"] = (
+                    ticker_fixed +
+                    pd.to_datetime(abnormal_df["expiry"]).dt.strftime("%y%m%d") +
+                    abnormal_df["cp"] +
+                    (abnormal_df["strike"]*1000).round().astype(int).astype(str).str.zfill(8)
+                )
+
+            # 2) 过滤出最后一个交易日
+            last_day  = abnormal_df["tradeDate"].max()
+            last_df   = abnormal_df[abnormal_df["tradeDate"] == last_day]
+
+            call_df   = last_df[last_df["cp"] == "C"]
+            put_df    = last_df[last_df["cp"] == "P"]
+
+            st.subheader(f"📌 {last_day:%Y-%m-%d} 当日异常合约")
+
+            c1, c2 = st.columns(2)
+
+            # ----- Call 表 + 下载 -----
+            with c1:
+                st.markdown("### 📘 Call")
+                if call_df.empty:
+                    st.info("该日无 Call 异常")
+                else:
+                    st.dataframe(call_df)
+                    st.download_button("下载 Call CSV",
+                        call_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"call_abn_{last_day:%Y%m%d}.csv")
+            # ----- Put 表 + 下载 -----
+            with c2:
+                st.markdown("### 📕 Put")
+                if put_df.empty:
+                    st.info("该日无 Put 异常")
+                else:
+                    st.dataframe(put_df)
+                    st.download_button("下载 Put CSV",
+                        put_df.to_csv(index=False).encode("utf-8"),
+                        file_name=f"put_abn_{last_day:%Y%m%d}.csv")
+
+            # 3) 过滤出该日 abnormal=True 的记录
+            if not call_df.empty or not put_df.empty:
+                c3, c4 = st.columns(2)
+                with c3:
+                    sel_call = st.selectbox("选择 Call 合约查看走势",
+                                            sorted(call_df["option_symbol"].unique()),
+                                            key="sel_call")
+                with c4:
+                    sel_put  = st.selectbox("选择 Put 合约查看走势",
+                                            sorted(put_df["option_symbol"].unique()),
+                                            key="sel_put")
+
+                if st.button("📊 同时查看两条合约走势图"):
+                    colL, colR = st.columns(2)
+                    with colL:
+                        st.markdown(f"#### Call {sel_call}")
+                        show_contract_chart(sel_call, api_key, cutoff_date=last_day)
+                    with colR:
+                        st.markdown(f"#### Put {sel_put}")
+                        show_contract_chart(sel_put, api_key, cutoff_date=last_day)
+
+            else:
+                st.info("最后一个交易日未检测到异常合约")
+
+            # ========== 页面 4 —— 新增：批量绘制 & 下载 ==========
+            # --------------------------------------------------
+            if not call_df.empty or not put_df.empty:
+                st.markdown("#### 🔄 批量绘制并下载当日异常合约走势图")
+                if st.button("🚀 生成全部图表"):
+                    call_figs, put_figs = {}, {}
+                    fail_call, fail_put = [], []
+                    total = len(call_df) + len(put_df)
+                    prog = st.progress(0)
+                    
+                    for i, opt in enumerate(call_df["option_symbol"]):
+                        fig = generate_contract_chart(opt, api_key, cutoff_date=last_day)
+                        if fig is not None:
+                            call_figs[opt] = fig
+                        else:
+                            fail_call.append(opt)
+                        prog.progress((i + 1) / total)
+                    for j, opt in enumerate(put_df["option_symbol"], start=len(call_df)):
+                        fig = generate_contract_chart(opt, api_key, cutoff_date=last_day)
+                        if fig is not None:
+                            put_figs[opt] = fig
+                        else:
+                            fail_put.append(opt)
+                        prog.progress((j + 1) / total)
+                    prog.empty()
+                    st.session_state["call_figs_today"] = call_figs
+                    st.session_state["put_figs_today"]  = put_figs
+
+                    if fail_call or fail_put:
+                        st.warning(f"抓取失败：Call {len(fail_call)} 张, Put {len(fail_put)} 张")
+
+                today_str = last_day.strftime("%Y%m%d")
+                if "call_figs_today" in st.session_state and st.session_state["call_figs_today"]:
+                    st.download_button(
+                        f"📥 下载 {today_str} 全部 Call 图 (ZIP)",
+                        figs_to_zip(st.session_state["call_figs_today"]),
+                        file_name=f"{today_str}_calls.zip",
+                        mime="application/zip"
+                    )
+                if "put_figs_today" in st.session_state and st.session_state["put_figs_today"]:
+                    st.download_button(
+                        f"📥 下载 {today_str} 全部 Put 图 (ZIP)",
+                        figs_to_zip(st.session_state["put_figs_today"]),
+                        file_name=f"{today_str}_puts.zip",
+                        mime="application/zip"
+                    )
+
+            # ---------- STEP-3: 异常合约清单 + 单合约图 ----------
+            if not abnormal_df.empty:
+
+                # 1) 如果已经有 option_symbol 列，直接用
+                if "option_symbol" in abnormal_df.columns:
+                    unique_opts = sorted(abnormal_df["option_symbol"].dropna().unique())
+
+                else:
+                    # —— 用页面最上面的 symbol 输入（单一 ticker）来拼接 —— #
+                    ticker_input = symbol.upper().ljust(6)          # 左填充至 6 位
+                    abnormal_df["option_symbol"] = (
+                        ticker_input +
+                        pd.to_datetime(abnormal_df["expiry"]).dt.strftime("%y%m%d") +
+                        abnormal_df["cp"] +
+                        (abnormal_df["strike"] * 1000).round()
+                            .astype(int).astype(str).str.zfill(8)
+                    )
+                    unique_opts = sorted(abnormal_df["option_symbol"].unique())
+
+                st.subheader("🧐 异常合约清单")
+                sel_opt = st.selectbox("选择合约查看过去 3 个月走势", unique_opts)
+
+                if st.button("📊 查看合约走势图"):
+                    show_contract_chart(sel_opt, api_key, cutoff_date=last_day)
+
+            # ---------- STEP-4 · 异常记录的 Volume-Weighted Payoff ----------
+        if not abnormal_df.empty:
+
+            abnormal_df["expiry"]    = pd.to_datetime(abnormal_df["expiry"],    errors="coerce")
+            abnormal_df["tradeDate"] = pd.to_datetime(abnormal_df["tradeDate"], errors="coerce")
+
+            st.markdown("### 💹 一键下载指定交易日的所有到期日 Payoff")
+            available_dates = sorted(abnormal_df["tradeDate"].unique(), reverse=True)
+            trade_date_sel  = st.selectbox("选择交易日", available_dates, format_func=lambda d: d.strftime("%Y-%m-%d"))
+
+            if st.button("🚀 生成并下载该日所有 Payoff 图"):
+                rows_td = abnormal_df[abnormal_df["tradeDate"] == trade_date_sel]
+                payoff_figs = {}
+                prog = st.progress(0)
+                exps = rows_td["expiry"].unique()
+                for k, exp in enumerate(exps):
+                    df_one = rows_td[rows_td["expiry"] == exp]
+                    fig = draw_payoff(df_one, exp, trade_date_sel.strftime("%Y-%m-%d"))
+                    payoff_figs[f"{exp}"] = fig
+                    prog.progress((k + 1) / len(exps))
+                prog.empty()
+                st.download_button(
+                    f"📥 下载 {trade_date_sel:%Y%m%d} 所有到期日 Payoff (ZIP)",
+                    figs_to_zip(payoff_figs),
+                    file_name=f"{trade_date_sel:%Y%m%d}_payoffs.zip",
+                    mime="application/zip"
+                )
+
+
+            # 基础列已经在前面 copy 并拼接 option_symbol，这里只需确保必要列存在
+            payoff_need = {"cp", "strike", "expiry", "tradeDate", "volume", "mid"}
+            if not payoff_need.issubset(abnormal_df.columns):
+                st.warning("异常表缺少绘制 Payoff 所需列")
+            else:
+                # 1️⃣ 选择到期日 & 交易日（仅限异常记录）
+                payoff_exp_opts = sorted(abnormal_df["expiry"].dt.date.unique())
+                st.subheader("🎯 Payoff（仅异常合约）")
+                sel_exp = st.selectbox("选择到期日", payoff_exp_opts, key="payoff_exp")
+
+                df_exp = abnormal_df[abnormal_df["expiry"].dt.date == sel_exp]
+                payoff_td_opts = sorted(df_exp["tradeDate"].dt.date.unique())
+                sel_td = st.selectbox("选择交易日", payoff_td_opts, key="payoff_td")
+
+                df_pay = df_exp[df_exp["tradeDate"].dt.date == sel_td]
+
+                if st.button("📊 绘制异常合约 Payoff", key="payoff_btn"):
+
+                    fig = draw_payoff(df_pay, sel_exp, sel_td)
+                    st.pyplot(fig)
+
+                    # 5️⃣ 明细表 & 下载（保持不变）
+                    st.markdown("##### 用于计算的异常合约明细")
+                    st.dataframe(df_pay)
+                    st.download_button(
+                        "📥 下载该批异常合约",
+                        df_pay.to_csv(index=False).encode("utf-8"),
+                        file_name=f"abn_payoff_{sel_exp}_{sel_td}.csv",
+                        mime="text/csv",
+                    )
+        else:
+            st.info("当前参数下无异常记录，无法绘制 Payoff")
+
+
+
+
+    else:
+        st.info("👉 请输入 Ticker 和 API Key，然后点击 “📡 下载…” 按钮先拉取数据。")
+
+# ---------------------------------------------
+elif page == "🆕 Page 5 | 特征筛选":
+    st.title("🆕 Page-5 ｜ 特征工程筛选")
+
+    # ========================= STEP-0 · 基础输入区 ========================= #
+    symbol  = st.text_input("股票代码（如 AAPL）")
+    base_date   = st.sidebar.date_input("📅 选择基准日期（下载区间将回溯选定数量个工作日（默认15））", value=pd.Timestamp.today())
+    lookback_days  = st.number_input("回溯工作日天数", min_value=1, max_value=252, value=15, step=1)
+    api_key = st.text_input("API Key", type="password", value=default_key)
+    scan_cp = st.radio("扫描范围", ["同时扫描 Call 与 Put", "只扫 Call", "只扫 Put"])
+
+    # ==================== STEP-0.1 · 新增阈值 (全部可调) ==================== #
+    with st.sidebar.expander("⚙️ 特征阈值", expanded=False):
+        notional_bp_input = st.number_input(
+            "Notional / 动态市值 ≥ (bp)",
+            min_value=0.001, max_value=100.0, value=10.0, step=0.001,
+            help="成交额占动态市值（bp）下限"
+        )
+        dd_adv_pct_input = st.number_input(
+            "|Dollar Delta| / (ADV×Underlying) ≥ (%)",
+            min_value=0.01, max_value=10.0, value=1.0, step=0.01,
+            help="Dollar Delta 与 ADV×标的市价 之比下限"
+        )
+        adv_min_input = st.number_input(
+            "ADV 最低阈值 (股)",
+            min_value=1_000, max_value=500_000_000, value=50_000, step=1,
+            help="标的过去 30 交易日平均成交量下限"
+        )
+
+        win_slider  = st.slider("滚动窗口 (工作日)", 2, 10, 3)
+        rel_slider  = st.slider("量比阈值", 0.5, 10.0, 3.0, 0.1)
+        vol_abs_thresh = st.slider("绝对量阈值", 100, 100000, 1000, 100)
+        vol_gt_oi   = st.checkbox("只保留 Volume > OpenInterest 的记录", value=False)
+
+    with st.sidebar.expander("⚙️ 高级设置 / 工具", expanded=False):
+        if st.button("♻️ 重新开始（清空缓存）"):
+            st.cache_data.clear()        # 清空 @st.cache_data/@st.cache_resource
+            st.cache_resource.clear()
+            st.session_state.clear()     # 清空会话级变量
+
+    # ========================= STEP-1 · 数据下载 ========================= #
+    if st.button("📡 下载选定交易日数据") and symbol and api_key:
+        workdays  = get_workdays(base_date, lookback_days)
+        cps       = ("C", "P") if scan_cp.startswith("同时") else ("C",) if "Call" in scan_cp else ("P",)
+        session   = requests.Session()
+        all_rows  = []
+
+        for trade_date in reversed(workdays):
+            dte_offset = (base_date - trade_date.date()).days
+            for cp in cps:
+                st.write(f"⏳ {trade_date:%Y-%m-%d} {cp}  DTE=[{dte_offset},{700+dte_offset}]")
+                df_day = fetch_option_data_for_day(symbol, trade_date,
+                                                   dte_offset, cp, api_key)
+                time.sleep(1.1)        # QPS <= 1
+                if df_day is not None and not df_day.empty:
+                    df_day["tradeDate"] = trade_date
+                    all_rows.append(df_day)
+
+        if not all_rows:
+            st.error("❌ 没有获取到任何数据。")
+        else:
+            st.session_state["raw_option_df"] = pd.concat(all_rows, ignore_index=True)
+            st.success(f"✅ 数据下载完毕，共 {len(st.session_state['raw_option_df'])} 行。"
+                       " 现在可以在侧边栏调参数实时查看结果。")
+            
+    # ========================= STEP-2 · 实时调参 & 检测 ========================= #
+    if "raw_option_df" in st.session_state:
+        raw_df = st.session_state["raw_option_df"]
+
+        # ------- 2.1 基础检测：滚动量比 + Notional K (复用第四页函数) ------- #
+        shares_out = get_shares_outstanding(symbol)
+        adv_series = get_adv_series(symbol, lookback_days + 35, base_date)
+        adv_series['Date'] = pd.to_datetime(adv_series['Date'])
+
+        if shares_out is None:
+            st.warning(f"⚠️ 无法自动获取 {symbol} 的流通股数，请手动输入。")
+            shares_out_million = st.number_input(
+                "手动输入流通股数（单位：百万股）",
+                min_value=0.1,
+                max_value=100_000.0,
+                value=100.0,       # 默认是 1 亿股
+                step=0.1,
+                format="%.2f"
+            )
+            shares_out = shares_out_million * 1_000_000
+
+        st.info(f"✔️ 使用的流通股数为：{shares_out:,.0f} 股")
+
+        base_df = detect_abnormal_trades_v2(
+            raw_df,
+            shares_out         = shares_out,
+            adv_series         = adv_series,
+            notional_bp_thresh = notional_bp_input,
+            dd_adv_pct_thresh  = dd_adv_pct_input,
+            adv_min_thresh     = adv_min_input,
+            win                = win_slider,
+            rel_thresh         = rel_slider,
+            vol_gt_oi          = vol_gt_oi,
+        )
+
+        # 4.2 全量结果
+        st.subheader("📈 全量记录（含 abnormal 标记）")
+        st.dataframe(base_df)
+        st.download_button(
+            "📥 下载全部记录 CSV",
+            base_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"{symbol}_all_records.csv",
+            mime="text/csv",
+        )
+
+        # 4.3 仅异常
+        abnormal_df = base_df[base_df["abnormal"]].copy()
         st.subheader("🚨 异常记录 (abnormal == True)")
         if abnormal_df.empty:
             st.info("本次参数设置下未检测到异常记录。")
