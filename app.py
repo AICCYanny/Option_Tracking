@@ -621,7 +621,8 @@ page = st.sidebar.selectbox("选择功能", [
     "🔍 获取期权集合（按 DTE + Moneyness/Delta）",
     "🗓️ 获取期权历史 EOD 数据",
     "📊 异常期权交易监测", 
-    "🆕 Page 5 | 特征筛选"
+    "🆕 Page 5 | 特征筛选",
+    "🗓️ Label数据下载"
 ])
 
 # --- 页面 1: Intraday IV 数据 ---
@@ -1517,3 +1518,68 @@ elif page == "🆕 Page 5 | 特征筛选":
     else:
         st.info("👉 请输入 Ticker 和 API Key，然后点击 “📡 下载…” 按钮先拉取数据。")
 
+
+elif page == "🗓️ Label数据下载":
+    st.title("🗓️ Label数据下载")
+
+    # ---- Session 缓冲区 ----
+    if "eod_buffer" not in st.session_state:
+        st.session_state["eod_buffer"] = []
+
+    col1, col2 = st.columns(2)
+    with col1:
+        ticker = st.text_input("股票代码 (Ticker)")
+        expiry = st.date_input("到期日")
+        trade_date  = st.date_input("交易日 (EOD 日期)")
+    with col2:
+        call_put = st.selectbox("Call / Put", ["C", "P"])
+        strike = st.number_input("执行价")
+
+    api_key = st.text_input("API Key", type="password", value=default_key, key="eod_api")
+
+    # ---- 构造 optionSymbol ----
+    if ticker and strike and api_key:
+        option_symbol = construct_option_symbol(
+            ticker, expiry.strftime("%Y-%m-%d"), call_put, strike
+        )
+        st.code(f"🧠 自动构造的 optionSymbol: {repr(option_symbol)}")
+
+    if st.button("🚀 获取该日数据"):
+        url = "https://restapi.ivolatility.com/equities/eod/single-stock-option-raw-iv"
+        params = {
+            "apiKey": api_key,
+            "symbol": option_symbol,
+            "from":   trade_date.strftime("%Y-%m-%d"),
+            "to":     trade_date.strftime("%Y-%m-%d")
+        }
+
+        with st.spinner("请求数据中..."):
+            res = requests.get(url, params=params)
+            if res.status_code != 200:
+                st.error(f"❌ 请求失败，状态码：{res.status_code}")
+            else:
+                data = res.json()
+
+                # 直接返回数据（通常只有 1 行）
+                if isinstance(data.get("data"), list) and data["data"]:
+                    df = pd.DataFrame(data["data"])
+                    st.success("✅ 获取成功！")
+                    st.write(df)
+                    # 缓存
+                    st.session_state["eod_buffer"].extend(df.to_dict("records"))
+                else:
+                    st.warning("⚠️ 未返回数据，请检查参数或日期。")
+
+    # ---- 汇总 & 下载 ----
+    st.subheader("📊 已抓取的数据汇总")
+    if st.session_state["eod_buffer"]:
+        all_df = pd.DataFrame(st.session_state["eod_buffer"])
+        st.dataframe(all_df)
+        st.download_button("📥 下载全部 CSV",
+                        all_df.to_csv(index=False).encode("utf-8"),
+                        file_name="option_eod_batch.csv",
+                        mime="text/csv")
+        if st.button("🗑️ 清空已抓数据"):
+            st.session_state["eod_buffer"] = []
+    else:
+        st.info("暂无数据")
