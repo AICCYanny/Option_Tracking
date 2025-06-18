@@ -9,3 +9,9 @@ gradio_app.py
 
 # 忽略 csv 文件
 *.csv
+
+# 忽略 png 图片文件
+*.png
+
+# 忽略 xlsx 文件
+*.xlsx
