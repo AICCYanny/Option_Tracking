@@ -7,6 +7,7 @@ import gzip
 import io
 import matplotlib.pyplot as plt
 from datetime import date
+import re
 
 from utils.calc_metrics import construct_option_symbol, get_workdays
 from utils.equity_enrich import get_adv_series, get_shares_outstanding
@@ -28,7 +29,8 @@ page = st.sidebar.selectbox("选择功能", [
     "🗓️ 获取期权历史 EOD 数据",
     "📊 异常期权交易监测", 
     "🆕 Page 5 | 特征筛选",
-    "🗓️ Label数据下载"
+    "🗓️ Label数据下载", 
+    "🆕 Page 6 | 批量下载"
 ])
 
 # --- 页面 1: Intraday IV 数据 ---
@@ -990,3 +992,76 @@ elif page == "🗓️ Label数据下载":
             st.session_state["eod_buffer"] = []
     else:
         st.info("暂无数据")
+
+
+# ---------------------------------------------
+elif page == "🆕 Page 6 | 批量下载":
+    st.title("🆕 Page-6 ｜ 批量下载数据")
+
+    # ========================= STEP-0 · 基础输入区 ========================= #
+    tickers_raw = st.text_area(
+        "输入股票代码（逗号、空格或换行分隔）",
+        value="AAPL, MSFT, TSLA"
+    )
+    base_date = st.date_input(
+        "📅 基准日期（回溯从该日期向前数工作日）",
+        value=pd.Timestamp.today()
+    )
+    lookback_days  = st.number_input("回溯工作日天数", min_value=1, max_value=252, value=15, step=1)
+    api_key = st.text_input("API Key", type="password", value=default_key)
+    scan_cp = st.radio("扫描范围", ["同时扫描 Call 与 Put", "只扫 Call", "只扫 Put"])
+
+    # ---------- 批量下载按钮 ----------
+    if st.button("📡 批量下载") and tickers_raw and api_key:
+        # ① 解析多 ticker
+        tickers = [
+            t.strip().upper()
+            for t in re.split(r"[,\s]+", tickers_raw)
+            if t.strip()
+        ]
+        if not tickers:
+            st.error("❌ 请输入至少一个有效的股票代码")
+            st.stop()
+
+        # ② 生成日期 / CP 组合
+        workdays = get_workdays(base_date, lookback_days)
+        cps = ("C", "P") if scan_cp.startswith("同时") else ("C",) if "Call" in scan_cp else ("P",)
+
+        # ③ 批量循环下载
+        session = requests.Session()
+        all_rows = []
+        total_tasks = len(tickers) * len(workdays) * len(cps)
+        progress = st.progress(0)
+        done = 0
+
+        for symbol in tickers:
+            for trade_date in reversed(workdays):
+                dte_offset = (base_date - trade_date.date()).days
+                for cp in cps:
+                    st.write(f"⏳ {symbol:<6} {trade_date:%Y-%m-%d} {cp}  "
+                             f"DTE=[{dte_offset}, {700 + dte_offset}]")
+                    df_day = fetch_option_data_for_day(
+                        symbol, trade_date, dte_offset, cp, api_key)
+                    time.sleep(1.1)  # QPS ≤ 1
+                    if df_day is not None and not df_day.empty:
+                        df_day["tradeDate"] = trade_date
+                        df_day["symbol"] = symbol        # <— 额外记录 ticker
+                        all_rows.append(df_day)
+
+                    done += 1
+                    progress.progress(done / total_tasks)
+
+        # ④ 结果展示 / 下载
+        if not all_rows:
+            st.warning("⚠️ 没有下载到任何数据。")
+        else:
+            big_df = pd.concat(all_rows, ignore_index=True)
+            st.success(f"✅ 下载完成，共 {len(big_df):,} 行。")
+            st.dataframe(big_df)
+
+            st.download_button(
+                "📥 下载汇总 CSV",
+                big_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"bulk_option_records_{base_date:%Y%m%d}.csv",
+                mime="text/csv",
+            )
