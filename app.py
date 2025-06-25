@@ -1003,16 +1003,23 @@ elif page == "🆕 Page 6 | 批量下载":
         "输入股票代码（逗号、空格或换行分隔）",
         value="AAPL, MSFT, TSLA"
     )
-    base_date = st.date_input(
-        "📅 基准日期（回溯从该日期向前数工作日）",
-        value=pd.Timestamp.today()
-    )
-    lookback_days  = st.number_input("回溯工作日天数", min_value=1, max_value=252, value=15, step=1)
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input("📅 起始日期", value=pd.Timestamp.today() - pd.Timedelta(days=5))
+    with col2:
+        end_date   = st.date_input("📅 结束日期", value=pd.Timestamp.today())
+
     api_key = st.text_input("API Key", type="password", value=default_key)
     scan_cp = st.radio("扫描范围", ["同时扫描 Call 与 Put", "只扫 Call", "只扫 Put"])
 
     # ---------- 批量下载按钮 ----------
     if st.button("📡 批量下载") and tickers_raw and api_key:
+
+        # 0. 校验日期
+        if start_date > end_date:
+            st.error("❌ 起始日期不能晚于结束日期")
+            st.stop()
+
         # ① 解析多 ticker
         tickers = [
             t.strip().upper()
@@ -1024,7 +1031,11 @@ elif page == "🆕 Page 6 | 批量下载":
             st.stop()
 
         # ② 生成日期 / CP 组合
-        workdays = get_workdays(base_date, lookback_days)
+        workdays = pd.bdate_range(start=start_date, end=end_date)
+        if workdays.empty:
+            st.error("❌ 该区间内没有任何工作日")
+            st.stop()
+
         cps = ("C", "P") if scan_cp.startswith("同时") else ("C",) if "Call" in scan_cp else ("P",)
 
         # ③ 批量循环下载
@@ -1036,7 +1047,7 @@ elif page == "🆕 Page 6 | 批量下载":
 
         for symbol in tickers:
             for trade_date in reversed(workdays):
-                dte_offset = (base_date - trade_date.date()).days
+                dte_offset = (end_date - trade_date.date()).days
                 for cp in cps:
                     st.write(f"⏳ {symbol:<6} {trade_date:%Y-%m-%d} {cp}  "
                              f"DTE=[{dte_offset}, {700 + dte_offset}]")
@@ -1062,6 +1073,6 @@ elif page == "🆕 Page 6 | 批量下载":
             st.download_button(
                 "📥 下载汇总 CSV",
                 big_df.to_csv(index=False).encode("utf-8"),
-                file_name=f"bulk_option_records_{base_date:%Y%m%d}.csv",
+                file_name=f"bulk_option_records_{start_date:%Y%m%d}_{end_date:%Y%m%d}.csv",
                 mime="text/csv",
             )
