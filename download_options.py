@@ -3,7 +3,10 @@
 增量下载期权数据 → Parquet（已自动展开分片）
 用法:
   python download_options.py --tickers AAPL MSFT --start 2025-04-01 --end 2025-05-01
-  python download_options.py --tickers TSLA --incremental
+  新增 ticker: 
+    python download_options.py --ticker TSLA --start 2025-04-01 --end 2025-05-01
+  每日更新: 
+    python download_options.py 
 """
 import os, json, argparse, asyncio, datetime as dt, gzip, io
 from pathlib import Path
