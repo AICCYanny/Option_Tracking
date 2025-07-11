@@ -36,13 +36,13 @@ HEADERS     = {"User-Agent": "SingularSquare/OptionTracker/1.0"}
 
 
 # ── 元数据 ───────────────────────────────────────────────────────
-def load_meta() -> dict:
+def load_meta() -> dict[str, dict[str,str]]:
     if META_FILE.exists():
         return json.loads(META_FILE.read_text())
     META_FILE.parent.mkdir(parents=True, exist_ok=True)
     return {}
 
-def save_meta(meta: dict):
+def save_meta(meta: dict[str, dict[str,str]]):
     META_FILE.write_text(json.dumps(meta, indent=2))
 
 # ── 带限速 + 重试的请求封装 ──────────────────────────────────────
@@ -232,7 +232,7 @@ def main():
         help="新 ticker 的起始下载日期 (YYYY-MM-DD)，当使用 --tickers 且有新 ticker 时必填"
     )
     ap.add_argument(
-        "--end", default=dt.date.today().isoformat(),
+        "--end", default=(dt.date.today() - dt.timedelta(days=1)).isoformat(),
         help="下载的结束日期 (YYYY-MM-DD)，默认今天"
     )
     args = ap.parse_args()
@@ -241,7 +241,7 @@ def main():
     if args.tickers and not args.start:
         ap.error("当使用 --tickers 时，必须通过 --start 指定起始日期")
 
-    end_date   = pd.to_datetime(args.end).date()
+    original_end = pd.to_datetime(args.end).date()
     user_start = pd.to_datetime(args.start).date() if args.start else None
     meta       = load_meta()
 
@@ -272,19 +272,53 @@ def main():
             await asyncio.gather(*tasks)
 
     jobs: List[tuple[str, dt.date, dt.date, int]] = []
+    meta_updates: list[tuple[str, str|None, str|None]] = []
+
     for sym in all_tickers:
+        was_known = sym in meta
+
+        if not was_known:
+            if user_start is None:
+                ap.error(f"新 ticker {sym} 必须提供 --start")
+            # 新 ticker：first 从 user_start 开始，last 设为 user_start 前一天
+            meta[sym] = {
+                "first": user_start.isoformat(),
+                "last":  (user_start - dt.timedelta(days=1)).isoformat()
+            }
+
+        rec   = meta[sym]  
+        first = pd.to_datetime(rec["first"]).date()
+        last  = pd.to_datetime(rec["last"]).date()
+        
         if args.tickers:
             # —— 情况 A：用户指定了 tickers 且提供了 start —— 
             # 新 ticker 用 user_start；旧 ticker 用 meta+1；end 一律用 args.end
-            if sym in meta:
-                start_date = pd.to_datetime(meta[sym]).date() + dt.timedelta(days=1)
+            if was_known:
+                start_date = last + dt.timedelta(days=1)
+            
             else:
                 start_date = user_start  # args.start 已保证非 None
 
+            end_date = original_end
+            new_first = None
+            new_last = original_end.isoformat()
+
         else:
-            # —— 情况 B：未指定 tickers 也未指定 start —— 增量更新 —— 
-            # 从 meta+1 到 end_date 拉取，并更新 meta
-            start_date = pd.to_datetime(meta[sym]).date() + dt.timedelta(days=1)
+            # —— 情况 B：未指定tickers 但提供了start —— 回填模式 ——
+            # 所有 ticker 使用 user_start；end_date 取决于 每一个 ticker 的 first 日期
+            if args.start and not args.tickers:
+                start_date = user_start
+                end_date = min(first - dt.timedelta(days=1), original_end)
+                new_first = min(first, start_date).isoformat()
+                new_last = None 
+
+            else:
+                # —— 情况 C：未指定 tickers 也未指定 start —— 增量更新 —— 
+                # 从 meta+1 到 end_date 拉取，并更新 meta
+                start_date = last + dt.timedelta(days=1)
+                end_date = original_end
+                new_first = None
+                new_last = max(last, end_date).isoformat()
 
         if start_date > end_date:
             print(f"{sym} 已最新（{start_date} > {end_date}），跳过")
@@ -296,11 +330,17 @@ def main():
         jobs.append(
             fetch_symbol(sym, start_date, end_date, progress=progress, task_id=tid)
         )
-
-        meta[sym] = end_date.isoformat()  # 预写元数据
+        meta_updates.append((sym, new_first, new_last))
 
     if jobs:
         asyncio.run(runner(jobs))
+
+        for sym, nf, nl in meta_updates:
+            if nf is not None:
+                meta[sym]["first"] = nf
+            if nl is not None:
+                meta[sym]["last"] = nl
+
         save_meta(meta)
         print("✅ All done")
     else:
