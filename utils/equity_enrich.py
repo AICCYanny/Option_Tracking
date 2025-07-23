@@ -66,3 +66,70 @@ def get_adv_series(ticker: str,
     except Exception as e:
         print(f"[Error] {ticker}: {e}")
         return pd.DataFrame(columns=["Date", "adv"])
+    
+def enrich_with_yf(data: pd.DataFrame, n_days: int) -> pd.DataFrame:
+    """
+    扩充数据，通过 yfinance 下载历史数据最早日期前 2 * int 天的股价数据并计算 adv 加入df
+
+    Parameters
+    ----------
+    data : pd.Dataframe
+        期权数据
+    n_days : int
+        回溯工作日数量 / 2
+
+    Return
+    ------
+    pd.Dataframe 
+        新增股价数据以及 adv
+    """
+    # 1. 统一 datetime 格式
+    df = data.copy()
+    df['date'] = pd.to_datetime(df['date'])
+
+    # 2. 取所有 ticker、计算下载区间
+    tickers = df['symbol'].unique().tolist()
+    start = df['date'].min() - BDay(n_days * 2)
+    end   = df['date'].max() + timedelta(days=1)
+
+    # 3. 一次性下载所有 ticker 的历史数据
+    raw = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        progress=False,
+        auto_adjust=False,
+        threads=False,
+    )
+
+    # 4. 把多级 columns 展平，并把行索引变成列
+    raw=raw.stack(level='Ticker', future_stack=True).reset_index()
+    raw = raw.rename(columns={
+        'Date':      'date',
+        'Ticker':    'symbol',
+        'Open':      'open_stock',
+        'High':      'high_stock',
+        'Low':       'low_stock',
+        'Close':     'close_stock',
+        'Adj Close': 'adj_close_stock',
+        'Volume':    'volume_stock',
+    })
+
+    # 5. 计算每个 ticker 上的 30 日 ADV
+    raw['adv'] = (
+        raw
+        .sort_values('date')
+        .groupby('symbol')['volume_stock']
+        .transform(lambda v: v.rolling(window=30, min_periods=30).mean())
+    )
+
+    # 6. 最后和原 df 通过 symbol+date 左连接
+    #    duplicate rows 会自动复制对应的 price/adv
+    out = pd.merge(
+        df,
+        raw,
+        on=['symbol', 'date'],
+        how='left'
+    )
+    return out
+    
