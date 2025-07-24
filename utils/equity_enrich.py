@@ -17,10 +17,13 @@ def get_shares_outstanding(ticker: str) -> int | None:
     """
     try:
         stock = yf.Ticker(ticker)
-        return stock.info.get("sharesOutstanding")
+        so = stock.info.get("sharesOutstanding")
     except Exception:
-        pass
-    return None
+        so = None
+    if so is None and ticker.upper() == 'ETHA':
+        so = 358_720_000
+
+    return so
 
 def get_adv_series(ticker: str, 
                    n_days: int,
@@ -120,7 +123,7 @@ def enrich_with_yf(data: pd.DataFrame, n_days: int) -> pd.DataFrame:
         raw
         .sort_values('date')
         .groupby('symbol')['volume_stock']
-        .transform(lambda v: v.rolling(window=30, min_periods=30).mean())
+        .transform(lambda v: v.rolling(window=30, min_periods=1).mean())
     )
 
     # 6. 最后和原 df 通过 symbol+date 左连接
