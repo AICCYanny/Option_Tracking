@@ -171,7 +171,7 @@ for col1, col2, _ in high_corr_pairs:
 
 print("Suggest Delete:", to_drop)
 
-final_cols = [col for col in numeric_cols if col not in to_drop]
+final_cols = [col for col in numeric_cols if col not in to_drop] + ['label']
 print("Final Features:", final_cols)
 
 # %%
