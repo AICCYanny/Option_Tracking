@@ -209,6 +209,12 @@ def build_summary(vol: pd.DataFrame, gex: pd.DataFrame, ticker_display: str) -> 
     prem_mom_phrase, _ = pct_phrase("环比", tot_prem_t, tot_prem_prev) if tot_prem_prev is not None else ("环比—", None)
     prem_yoy_phrase, _ = pct_phrase("同比", tot_prem_t, tot_prem_far) if tot_prem_far is not None else ("同比—", None)
 
+    call_prem_mom_phrase, _ = pct_phrase("环比", call_prem_t, call_prem_prev) if call_prem_prev is not None else ("环比—", None)
+    call_prem_yoy_phrase, _ = pct_phrase("同比", call_prem_t, call_prem_far) if call_prem_far is not None else ("同比—", None)
+
+    put_prem_mom_phrase, _ = pct_phrase("环比", put_prem_t, put_prem_prev) if put_prem_prev is not None else ("环比—", None)
+    put_prem_yoy_phrase, _ = pct_phrase("同比", put_prem_t, put_prem_far) if put_prem_far is not None else ("同比—", None)
+
     # GEX: take last two dates (sorted ascending) -> today = last, prev = second last
     gex_today = gex.iloc[-1] if (gex is not None and len(gex) >= 1) else None
     gex_prev = gex.iloc[-2] if (gex is not None and len(gex) >= 2) else None
@@ -247,13 +253,19 @@ def build_summary(vol: pd.DataFrame, gex: pd.DataFrame, ticker_display: str) -> 
     # Fifth line: premium changes
     line5 = f"\n\n成交额{prem_mom_phrase}，{prem_yoy_phrase}。"
 
-    # Sixth line: OI change
-    line6 = f"\n\nOI{oi_phrase_text}。"
+    # Sixth line: call premium changes
+    line6 = f"\n\nCall成交额{call_prem_mom_phrase}，{call_prem_yoy_phrase}。"
 
-    # Seventh line: GEX
-    line7 = f"\n\n{gex_line}"
+    # Seventh line: put premium changes
+    line7 = f"\n\nPut成交额{put_prem_mom_phrase}，{put_prem_yoy_phrase}。"
 
-    return line1 + line2 + line3 + line4 + line5 + line6 + line7
+    # Eighth line: OI change
+    line8 = f"\n\nOI{oi_phrase_text}。"
+
+    # Nineth line: GEX
+    line9 = f"\n\n{gex_line}"
+
+    return line1 + line2 + line3 + line4 + line5 + line6 + line7 + line8 + line9
 
 
 # -----------------------------
