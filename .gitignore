@@ -15,3 +15,12 @@ gradio_app.py
 
 # 忽略 xlsx 文件
 *.xlsx
+
+# 忽略 sqlite 文件
+*.db
+*.sqlite3
+*.sqlite
+
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
