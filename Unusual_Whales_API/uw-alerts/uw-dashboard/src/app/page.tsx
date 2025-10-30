@@ -31,6 +31,8 @@ type GreeksRow = {
   vanna: number | null;
   charm: number | null;
   volatility: number | null;
+  expiry: string | null;
+  otm_pct: number | null;
 };
 
 type PriceRow = {
@@ -149,6 +151,16 @@ function fmtNum(
   return nf.format(n);
 }
 
+function fmtPct(
+  val: string | number | null | undefined,
+  digits = 2
+): string {
+  if (val === null || val === undefined) return "—";
+  const n = typeof val === "number" ? val : Number(val);
+  if (Number.isNaN(n)) return "—";
+  return `${fmtNum(n * 100, digits)}%`;
+}
+
 /** -- Color base on side */
 function sidePalette(side?: string | null) {
   const s = (side ?? "").toUpperCase();
@@ -165,6 +177,108 @@ function sidePalette(side?: string | null) {
       ? "bg-red-600/20 text-red-300"
       : "bg-gray-600/20 text-gray-300",
   };
+}
+
+/** —— CSV 工具 —— */
+function csvEscape(v: unknown): string {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+function toCsv(headers: string[], rows: (string | number | null | undefined)[][]): string {
+  const head = headers.map(csvEscape).join(",");
+  const body = rows.map(r => r.map(csvEscape).join(",")).join("\n");
+  return head + "\n" + body;
+}
+function downloadText(filename: string, text: string, mime = "text/csv;charset=utf-8") {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
+/** —— 简易并发限制器（默认 6 并发） —— */
+function pLimit(concurrency = 6) {
+  let active = 0;
+  const queue: (() => void)[] = [];
+  const next = () => {
+    active--;
+    if (queue.length) {
+      const fn = queue.shift()!;
+      fn();
+    }
+  };
+  return async function run<T>(task: () => Promise<T>): Promise<T> {
+    if (active >= concurrency) {
+      await new Promise<void>(res => queue.push(res));
+    }
+    active++;
+    try {
+      return await task();
+    } finally {
+      next();
+    }
+  };
+}
+
+/** —— 业务用常量：两组 ticker —— */
+const INDICES = new Set(["QQQ", "SPY", "IWM"]);
+const M7 = new Set(["AAPL", "NVDA", "TSLA", "META", "AMZN", "GOOGL", "GOOG", "MSFT"]);
+
+/** —— 解析 ticker 过滤输入 —— */
+function parseTickerFilter(input: string) {
+  // tokens: 用 , 或空白分割；支持 ! 和 *（前缀通配）
+  const tokens = input
+    .split(/[,\s]+/)
+    .map(s => s.trim().toUpperCase())
+    .filter(Boolean);
+
+  const include: string[] = [];
+  const exclude: string[] = [];
+
+  for (const t of tokens) {
+    if (t.startsWith("!")) exclude.push(t.slice(1));
+    else include.push(t);
+  }
+  return { include, exclude };
+}
+
+/** —— 符号是否匹配 tokens —— */
+function matchSymbol(symRaw: string | null | undefined, include: string[], exclude: string[]): boolean {
+  const sym = (symRaw ?? "").toUpperCase();
+  if (!sym) return false;
+
+  // 命中排除：直接 false
+  for (const ex of exclude) {
+    if (ex.endsWith("*")) {
+      const pre = ex.slice(0, -1);
+      if (pre && sym.startsWith(pre)) return false;
+    } else if (sym === ex) {
+      return false;
+    }
+  }
+
+  // include 为空 => 不做包含限制（= 全部通过）
+  if (include.length === 0) return true;
+
+  // 否则需要命中任一 include
+  for (const inc of include) {
+    if (inc.endsWith("*")) {
+      const pre = inc.slice(0, -1);
+      if (pre && sym.startsWith(pre)) return true;
+    } else if (sym === inc) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** —— 市场时段/可见性 —— */
@@ -211,6 +325,10 @@ export default function HomePage() {
   const [metricsLoading, setMetricsLoading] = useState<boolean>(false);
   const [tab, setTab] = useState<TabKey>("greeks");
 
+  // review input
+  const [tradeTypesDraft, setTradeTypesDraft] = useState("");
+  const [reasonCodesDraft, setReasonCodesDraft] = useState("");
+
   // 全屏查看
   const [fullOpen, setFullOpen] = useState(false);
 
@@ -244,6 +362,34 @@ export default function HomePage() {
       setLoading(false);
     }
   }, [bizDate]);
+
+    // 过滤输入框
+  const [symbolFilter, setSymbolFilter] = useState<string>("");
+
+  // 派生：按过滤条件得到要渲染的行
+  const filteredRows = useMemo(() => {
+    const { include, exclude } = parseTickerFilter(symbolFilter);
+    if (include.length === 0 && exclude.length === 0) return rows;
+    return rows.filter(r => matchSymbol(r.symbol, include, exclude));
+  }, [rows, symbolFilter]);
+
+  // 只根据 symbolFilter 判断当前 selected 是否仍然匹配过滤条件
+  useEffect(() => {
+    if (!selected) return;
+    const { include, exclude } = parseTickerFilter(symbolFilter);
+    if (!matchSymbol(selected.symbol, include, exclude)) {
+      setSelected(null);
+      setReview(null);
+    }
+  }, [symbolFilter, selected]);
+
+
+
+    //Synchronize review -> draft
+    useEffect(() => {
+      setTradeTypesDraft((review?.trade_types ?? []).join(", "));
+      setReasonCodesDraft((review?.reason_codes ?? []).join(", "));
+    }, [review?.trade_types, review?.reason_codes]);
 
   // 初始化 / 切换日期时加载
   useEffect(() => {
@@ -321,10 +467,10 @@ export default function HomePage() {
     try {
       const payload: ReviewIn = {
         decision: (review.decision ?? null) as Decision,
-        trade_types: review.trade_types ?? [],
-        reason_codes: review.reason_codes ?? [],
+        trade_types: parseCsvToList(tradeTypesDraft),
+        reason_codes: parseCsvToList(reasonCodesDraft),
         notes: review.notes ?? null,
-        reviewed_by: review.reviewed_by ?? "me",
+        reviewed_by: review.reviewed_by ?? "MC",
         row_version: review.row_version ?? 0,
       };
       const saved = await saveReview(selected.alert_id, payload);
@@ -350,6 +496,164 @@ export default function HomePage() {
 
   const decisions: Exclude<Decision, null>[] = ["accept", "reject", "watch"];
 
+  /** —— 将 alert + greeks + price 拍平为一行 —— */
+function buildCsvRow(
+  a: AlertRow,
+  g: GreeksRow | null,
+  p: PriceRow | null
+) {
+  // 注意：所有时间统一转 ET 可读格式
+  return [
+    a.alert_id,
+    toET(a.created_at_utc ?? a.created_at ?? ""),
+    a.biz_date_et ?? "",
+    a.symbol ?? "",
+    a.option_symbol ?? "",
+    a.ask_volume ?? "",
+    a.bid_volume ?? "",
+    a.volume ?? "",
+    a.avg_fill ?? "",
+    a.close ?? "",
+    a.diff ?? "",
+    a.total_premium ?? "",
+    a.iv_change ?? "",
+    a.open_interest ?? "",
+    a.vol_oi_ratio ?? "",
+    a.multi_leg_vol_ratio ?? "",
+
+    // —— Greeks（可为空）
+    g ? toET(g.snapshot_at ?? "") : "",
+    g?.option_symbol ?? "",
+    g?.side ?? "",
+    g?.expiry ?? "",
+    g?.dte ?? "",
+    g?.strike ?? "",
+    g?.otm_pct ?? "",
+    g?.delta ?? "",
+    g?.gamma ?? "",
+    g?.theta ?? "",
+    g?.rho ?? "",
+    g?.vega ?? "",
+    g?.vanna ?? "",
+    g?.charm ?? "",
+    g?.volatility ?? "",
+
+    // —— Price（可为空）
+    p ? toET(p.snapshot_at ?? "") : "",
+    p?.market_time ?? "",
+    p?.stock_close ?? "",
+    p?.stock_previous_close ?? "",
+    p?.stock_volume ?? "",
+    p?.stock_total_volume ?? "",
+  ];
+}
+
+/** —— CSV 表头 —— */
+const CSV_HEADERS = [
+  // Alert
+  "alert_id","created_at_et","biz_date_et","symbol","option_symbol",
+  "ask_volume","bid_volume","volume","avg_fill","close","diff",
+  "total_premium","iv_change","open_interest","vol_oi_ratio","multi_leg_vol_ratio",
+  // Greeks
+  "greeks_snapshot_et","greeks_option","greeks_side","greeks_expiry","greeks_dte",
+  "greeks_strike","greeks_otm_pct","delta","gamma","theta","rho","vega","vanna","charm","volatility",
+  // Price
+  "price_snapshot_et","market_time","stock_close","stock_prev_close","stock_volume","stock_total_volume"
+];
+
+/** —— 导出某一组（Indices / M7）为 CSV —— */
+async function downloadGroupCsv(groupName: "Indices" | "M7", symbolSet: Set<string>) {
+  try {
+    setMsg("");
+
+    // 默认用当前页面的数据（避免 limit 超限）。若想只导出过滤后的，改成 filteredRows
+    const data = rows;
+    const targets = data.filter(r => symbolSet.has((r.symbol ?? "").toUpperCase()));
+    if (targets.length === 0) {
+      setMsg(`No alerts for ${groupName} on ${bizDate}.`);
+      return;
+    }
+
+    const limit = pLimit(6);
+    const rowsOut: (string | number | null | undefined)[][] = [];
+
+    await Promise.all(targets.map(a =>
+      limit(async () => {
+        const [gk, pr] = await Promise.allSettled([
+          fetchAlertGreeks(a.alert_id),
+          fetchAlertPrice(a.alert_id),
+        ]);
+        const g = gk.status === "fulfilled" ? gk.value : null;
+        const p = pr.status === "fulfilled" ? pr.value : null;
+        rowsOut.push(buildCsvRow(a, g, p));
+      })
+    ));
+
+    // 可选：按创建时间（CSV_HEADERS 的第2列 created_at_et）排序
+    rowsOut.sort((ra, rb) => {
+      const aT = new Date(String(ra[1] ?? "")).getTime();
+      const bT = new Date(String(rb[1] ?? "")).getTime();
+      return (isNaN(aT) ? 0 : aT) - (isNaN(bT) ? 0 : bT);
+    });
+
+    const csv = toCsv(
+      CSV_HEADERS.slice(1),       
+      rowsOut.map(r => r.slice(1)) 
+    );
+    downloadText(`${groupName}_${bizDate}.csv`, csv);
+    setMsg(`${groupName} CSV exported (${rowsOut.length} rows).`);
+  } catch (e) {
+    setMsg(`Export failed: ${errMsg(e)}`);
+  }
+}
+
+/** —— 导出“当前过滤结果”为 CSV（含 greeks / price） —— */
+async function downloadFilteredCsv() {
+  try {
+    setMsg("");
+    if (filteredRows.length === 0) {
+      setMsg("No filtered alerts.");
+      return;
+    }
+
+    const limit = pLimit(6);
+    const rowsOut: (string | number | null | undefined)[][] = [];
+
+    await Promise.all(
+      filteredRows.map(a =>
+        limit(async () => {
+          const [gk, pr] = await Promise.allSettled([
+            fetchAlertGreeks(a.alert_id),
+            fetchAlertPrice(a.alert_id),
+          ]);
+          const g = gk.status === "fulfilled" ? gk.value : null;
+          const p = pr.status === "fulfilled" ? pr.value : null;
+          rowsOut.push(buildCsvRow(a, g, p));
+        })
+      )
+    );
+
+    // 按创建时间排序（CSV_HEADERS 第2列 created_at_et）
+    rowsOut.sort((ra, rb) => {
+      const aT = new Date(String(ra[1] ?? "")).getTime();
+      const bT = new Date(String(rb[1] ?? "")).getTime();
+      return (isNaN(aT) ? 0 : aT) - (isNaN(bT) ? 0 : bT);
+    });
+
+    const csv = toCsv(
+      CSV_HEADERS.slice(1),       
+      rowsOut.map(r => r.slice(1)) 
+    );
+    downloadText(`Filtered_${bizDate}.csv`, csv);
+    setMsg(`Filtered CSV exported (${rowsOut.length} rows).`);
+  } catch (e) {
+    setMsg(`Export failed: ${errMsg(e)}`);
+  }
+}
+
+
+
+
   return (
     <main className="p-6 max-w-7xl mx-auto">
       <h1 className="text-2xl font-semibold mb-4">UW Alerts — Review Console</h1>
@@ -372,6 +676,58 @@ export default function HomePage() {
         >
           {loading ? "Loading..." : "Reload"}
         </button>
+        <label className="text-sm">
+          Filter tickers:
+          <input
+            type="text"
+            value={symbolFilter}
+            onChange={(e) => setSymbolFilter(e.target.value)}
+            placeholder="e.g. NVDA, AAPL  or  SP*  or  !QQQ"
+            className="ml-2 border rounded px-2 py-1 w-64"
+          />
+        </label>
+        <button
+          onClick={() => setSymbolFilter("")}
+          className="px-3 py-1 rounded border border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+        >
+          Clear
+        </button>
+
+        {/* 小统计：当前/总数 */}
+        <span className="text-xs text-gray-500 ml-1">
+          {filteredRows.length}/{rows.length}
+        </span>
+
+        <button
+          onClick={() => downloadGroupCsv("Indices", INDICES)}
+          className="px-3 py-1 rounded border border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+          disabled={loading}
+        >
+          Download Indices (CSV)
+        </button>
+
+        <button
+          onClick={() => downloadGroupCsv("M7", M7)}
+          className="px-3 py-1 rounded border border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+          disabled={loading}
+        >
+          Download M7 (CSV)
+        </button>
+
+        <button
+          type="button"
+          onClick={() => { void downloadFilteredCsv(); }}
+          className="px-3 py-1 rounded border border-gray-700 bg-gray-900 text-gray-100 hover:bg-gray-800"
+          disabled={filteredRows.length === 0}
+          title={filteredRows.length ? "Export current filtered alerts" : "No filtered rows"}
+        >
+          Download Filtered (CSV)
+        </button>
+
+
+
+
+
         {msg && <div className="text-sm text-gray-600">{msg}</div>}
       </div>
 
@@ -379,7 +735,7 @@ export default function HomePage() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2">
           <AlertsTable
-            rows={rows}
+            rows={filteredRows}
             onSelect={onSelect}
             selectedId={selected?.alert_id ?? null}
           />
@@ -455,16 +811,18 @@ export default function HomePage() {
                           <KV k="Snapshot (ET)" v={toET(greeks.snapshot_at ?? "")} />
                           <KV k="Option" v={greeks.option_symbol ?? "—"} />
                           <KV k="Side" v={greeks.side ?? "—"} />
+                          <KV k="Expiry" v={greeks.expiry ?? "—"} />
                           <KV k="DTE" v={fmtNum(greeks.dte, 0)} />
                           <KV k="Strike" v={fmtNum(greeks.strike)} />
-                          <KV k="Delta" v={fmtNum(greeks.delta)} />
-                          <KV k="Gamma" v={fmtNum(greeks.gamma)} />
-                          <KV k="Theta" v={fmtNum(greeks.theta)} />
-                          <KV k="Rho" v={fmtNum(greeks.rho)} />
-                          <KV k="Vega" v={fmtNum(greeks.vega)} />
-                          <KV k="Vanna" v={fmtNum(greeks.vanna)} />
-                          <KV k="Charm" v={fmtNum(greeks.charm)} />
-                          <KV k="Volatility" v={fmtNum(greeks.volatility)} />
+                          <KV k="OTM %" v={fmtPct(greeks.otm_pct)} />
+                          <KV k="Delta" v={fmtNum(greeks.delta, 5)} />
+                          <KV k="Gamma" v={fmtNum(greeks.gamma, 5)} />
+                          <KV k="Theta" v={fmtNum(greeks.theta, 5)} />
+                          <KV k="Rho" v={fmtNum(greeks.rho, 5)} />
+                          <KV k="Vega" v={fmtNum(greeks.vega, 5)} />
+                          <KV k="Vanna" v={fmtNum(greeks.vanna, 5)} />
+                          <KV k="Charm" v={fmtNum(greeks.charm, 5)} />
+                          <KV k="Volatility" v={fmtNum(greeks.volatility, 5)} />
                         </div>
                       )}
                     </div>
@@ -586,20 +944,8 @@ export default function HomePage() {
                     <input
                       className="w-full border rounded px-2 py-1 text-sm"
                       placeholder="single-leg, spread, earnings, roll..."
-                      value={(review?.trade_types ?? []).join(", ")}
-                      onChange={(e) =>
-                        setReview((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                trade_types: e.target.value
-                                  .split(",")
-                                  .map((s) => s.trim())
-                                  .filter(Boolean),
-                              }
-                            : prev
-                        )
-                      }
+                      value={tradeTypesDraft}
+                      onChange={(e) => setTradeTypesDraft(e.target.value)}
                     />
                   </div>
 
@@ -608,20 +954,8 @@ export default function HomePage() {
                     <input
                       className="w-full border rounded px-2 py-1 text-sm"
                       placeholder="iv, sweep, block, catalyst..."
-                      value={(review?.reason_codes ?? []).join(", ")}
-                      onChange={(e) =>
-                        setReview((prev) =>
-                          prev
-                            ? {
-                                ...prev,
-                                reason_codes: e.target.value
-                                  .split(",")
-                                  .map((s) => s.trim())
-                                  .filter(Boolean),
-                              }
-                            : prev
-                        )
-                      }
+                      value={reasonCodesDraft}
+                      onChange={(e) => setReasonCodesDraft(e.target.value)}
                     />
                   </div>
 
@@ -699,12 +1033,17 @@ export default function HomePage() {
         greeks={greeks}
         price={price}
         buckets={buckets}
+        review={review}
       />
     </main>
   );
 }
 
 /** —— 小组件 —— */
+function parseCsvToList(s: string): string[] {
+  return s.split(/[,\n]/).map(x => x.trim()).filter(Boolean);
+}
+
 function KV({
   k,
   v,
@@ -758,6 +1097,38 @@ function TD({ children }: { children: React.ReactNode }) {
   return <td className="px-2 py-2 whitespace-nowrap">{children}</td>;
 }
 
+function DecisionBadge({ decision }: { decision: Decision | null }) {
+  const map: Record<string, string> = {
+    accept: "bg-green-600/20 text-green-300 border-green-700",
+    reject: "bg-red-600/20 text-red-300 border-red-700",
+    watch:  "bg-amber-500/20 text-amber-300 border-amber-600",
+  };
+  const cls =
+    decision ? map[decision] ?? "bg-gray-600/20 text-gray-300 border-gray-700" : "bg-gray-600/20 text-gray-300 border-gray-700";
+  const label = decision ?? "none";
+  return (
+    <span className={`px-2 py-0.5 rounded border text-xs ${cls}`}>{label}</span>
+  );
+}
+
+function Chips({ items }: { items: string[] }) {
+  if (!items || items.length === 0) {
+    return <span className="text-gray-500">—</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {items.map((t, i) => (
+        <span
+          key={`${t}-${i}`}
+          className="px-2 py-0.5 rounded-full border border-gray-700 bg-gray-800/60 text-gray-100 text-xs"
+        >
+          {t}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 /** —— 全屏覆盖层（不显示 alert_id，黑底白字版，支持导出 PNG） —— */
 function AlertFullOverlay({
   open,
@@ -766,6 +1137,7 @@ function AlertFullOverlay({
   greeks,
   price,
   buckets,
+  review,
 }: {
   open: boolean;
   onClose: () => void;
@@ -790,48 +1162,76 @@ function AlertFullOverlay({
   greeks: GreeksRow | null;
   price: PriceRow | null;
   buckets: BucketRow[] | null;
+  review: ReviewOut | null;
 }) {
   /** ✅ Hooks 必须在顶部调用，不能放在条件分支之后 */
   const contentRef = useRef<HTMLDivElement | null>(null);
 
   const palette = sidePalette(greeks?.side);
 
-  /** 导出为 PNG（非 Hook，普通函数没问题） */
-  async function handleDownloadPng() {
-    if (!contentRef.current) return;
-
-    // 读取真实内容尺寸
+  /** Download PNG */
+  async function handleDownloadPng(hidpi: number = 2) {
     const node = contentRef.current;
-    const sw = node.scrollWidth || node.clientWidth;
-    const sh = node.scrollHeight || node.clientHeight;
+    if (!node) return;
 
-    // 大多数浏览器的单张 canvas 高度上限大约在 16384 像素
-    const MAX_CANVAS = 16384;
+    // 实际内容尺寸
+    const rect = node.getBoundingClientRect();
+    const sw = Math.max(node.scrollWidth,  Math.ceil(rect.width));
+    const sh = Math.max(node.scrollHeight, Math.ceil(rect.height));
 
-    // 如果太高，就按比例整体缩小，保证导出高度 <= 上限
-    const scale = sh > MAX_CANVAS ? MAX_CANVAS / sh : 1;
+    // 浏览器安全上限（保守，兼容 Safari）
+    const MAX_DIM = 14336;               // 单边像素上限
+    const MAX_PIXELS = 180_000_000;      // 总像素上限（约 180MP）
+
+    // 先算“为了不超限，需要的基础缩放”
+    const byW = MAX_DIM / sw;
+    const byH = MAX_DIM / sh;
+    const byA = Math.sqrt(MAX_PIXELS / (sw * sh));
+    const baseScale = Math.min(1, byW, byH, byA);
+
+    // 缩放后的导出逻辑尺寸（不含 pixelRatio）
+    const outW = Math.max(1, Math.floor(sw * baseScale));
+    const outH = Math.max(1, Math.floor(sh * baseScale));
+
+    // 在不突破上限的前提下，尽量把 pixelRatio 拉高（= 超采样）
+    const maxPrByW = MAX_DIM / outW;
+    const maxPrByH = MAX_DIM / outH;
+    const maxPrByA = Math.sqrt(MAX_PIXELS / (outW * outH));
+    const dpr = window.devicePixelRatio || 1;
+
+    // 期望的清晰度倍率：设备 DPR * 目标 hidpi（2/3），再夹到 3x 以内
+    const wanted = Math.min(Math.max(1, dpr * hidpi), 3);
+    const pixelRatio = Math.min(wanted, maxPrByW, maxPrByH, maxPrByA);
 
     try {
       const dataUrl = await toPng(node, {
         cacheBust: true,
-        backgroundColor: "#111827", // 与 bg-gray-900 一致，避免透明底
-        // 导出目标尺寸（缩放后）
-        width: Math.floor(sw * scale),
-        height: Math.floor(sh * scale),
-        pixelRatio: 1, // 我们用 width/height 控制清晰度，避免再次放大导致超限
-        // 在克隆节点上应用缩放（等比缩小后再渲染）
+        backgroundColor: "#111827",
+        // 用宽高 + pixelRatio 控制实际画布像素数
+        width: outW,
+        height: outH,
+        pixelRatio,
+        // 克隆节点样式：移除左右留白、锁定尺寸、按 baseScale 等比整体缩放
         style: {
-          transform: `scale(${scale})`,
-          transformOrigin: "top left",
+          margin: "0",
+          maxWidth: "none",
           width: `${sw}px`,
           height: `${sh}px`,
+          transform: `scale(${baseScale})`,
+          transformOrigin: "top left",
+          paddingLeft: "16px",
+          paddingRight: "16px",
+          // 文本抗锯齿（对某些平台有帮助）
+          // @ts-expect-error -- vendor-prefixed property not in React.CSSProperties
+          "-webkit-font-smoothing": "antialiased",
+          "text-rendering": "geometricPrecision",
         },
       });
 
       const a = document.createElement("a");
       const sym = alert?.symbol ?? "alert";
       a.href = dataUrl;
-      a.download = `${sym}_details_${Date.now()}.png`;
+      a.download = `${sym}_details_${Date.now()}_${Math.round(pixelRatio*100)}ppi.png`;
       a.click();
     } catch (e) {
       console.error(e);
@@ -839,8 +1239,11 @@ function AlertFullOverlay({
     }
   }
 
+
   /** 再做早退就不会违反规则了 */
   if (!open) return null;
+
+const onDownloadPngClick = () => { void handleDownloadPng(2); };
 
   return (
     <div className="fixed inset-0 z-50 bg-gray-900 text-gray-100">
@@ -851,7 +1254,7 @@ function AlertFullOverlay({
           <div className="flex items-center gap-2">
             <button
               type="button"
-              onClick={handleDownloadPng}
+              onClick={onDownloadPngClick}
               className="text-sm px-3 py-1 rounded border border-gray-600 bg-gray-800 text-gray-100 hover:bg-gray-700"
             >
               Download PNG
@@ -880,9 +1283,9 @@ function AlertFullOverlay({
               <KV k="Biz Date (ET)" v={alert.biz_date_et ?? "—"} />
               <KV k="Symbol" v={alert.symbol ?? "—"} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="Option" v={alert.option_symbol ?? "—"} keyClassName={palette.key} valueClassName={palette.val} />
-              <KV k="Ask Vol" v={fmtNum(alert.ask_volume, 0, { group: true })} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Ask Vol" v={fmtNum(alert.ask_volume, 0)} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="Bid Vol" v={fmtNum(alert.bid_volume, 0)} />
-              <KV k="Volume" v={fmtNum(alert.volume, 0, { group: true })} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Volume" v={fmtNum(alert.volume, 0)} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="Avg Fill" v={fmtNum(alert.avg_fill)} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="Close" v={fmtNum(alert.close)} />
               <KV k="Diff" v={fmtNum(alert.diff)} />
@@ -904,16 +1307,18 @@ function AlertFullOverlay({
               <KV k="Snapshot (ET)" v={toET(greeks.snapshot_at ?? "")} />
               <KV k="Option" v={greeks.option_symbol ?? "—"} />
               <KV k="Side" v={greeks.side ?? "—"} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Expiry" v={greeks.expiry ?? "—"} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="DTE" v={fmtNum(greeks.dte, 0)} keyClassName={palette.key} valueClassName={palette.val} />
               <KV k="Strike" v={fmtNum(greeks.strike)} keyClassName={palette.key} valueClassName={palette.val} />
-              <KV k="Delta" v={fmtNum(greeks.delta)} keyClassName={palette.key} valueClassName={palette.val} />
-              <KV k="Gamma" v={fmtNum(greeks.gamma)} keyClassName={palette.key} valueClassName={palette.val} />
-              <KV k="Theta" v={fmtNum(greeks.theta)} />
-              <KV k="Rho" v={fmtNum(greeks.rho)} />
-              <KV k="Vega" v={fmtNum(greeks.vega)} />
-              <KV k="Vanna" v={fmtNum(greeks.vanna)} />
-              <KV k="Charm" v={fmtNum(greeks.charm)} />
-              <KV k="Volatility" v={fmtNum(greeks.volatility)} />
+              <KV k="OTM %" v={fmtPct(greeks.otm_pct)} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Delta" v={fmtNum(greeks.delta, 5)} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Gamma" v={fmtNum(greeks.gamma, 5)} keyClassName={palette.key} valueClassName={palette.val} />
+              <KV k="Theta" v={fmtNum(greeks.theta, 5)} />
+              <KV k="Rho" v={fmtNum(greeks.rho, 5)} />
+              <KV k="Vega" v={fmtNum(greeks.vega, 5)} />
+              <KV k="Vanna" v={fmtNum(greeks.vanna, 5)} />
+              <KV k="Charm" v={fmtNum(greeks.charm, 5)} />
+              <KV k="Volatility" v={fmtNum(greeks.volatility, 5)} />
             </div>
           )}
         </section>
@@ -984,6 +1389,53 @@ function AlertFullOverlay({
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+        </section>
+
+        {/* Review */}
+        <section>
+          <h3 className="text-base font-semibold mb-3 text-white">Review</h3>
+          {!review ? (
+            <div className="text-gray-400 text-sm">None</div>
+          ) : (
+            <div className="space-y-3 text-sm">
+              {/* 第一行：Decision + 审核人/时间 */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-gray-400">Decision:</span>
+                <DecisionBadge decision={review.decision ?? null} />
+                <span className="text-gray-500">•</span>
+                <span className="text-gray-400">Reviewer:</span>
+                <span className="text-gray-100">{review.reviewed_by ?? "—"}</span>
+                <span className="text-gray-500">•</span>
+                <span className="text-gray-400">Reviewed at:</span>
+                <span className="text-gray-100">
+                  {review.reviewed_at ? toET(review.reviewed_at) : "—"}
+                </span>
+                <span className="text-gray-500">•</span>
+                <span className="text-gray-400">Row ver:</span>
+                <span className="text-gray-100">{review.row_version ?? 0}</span>
+              </div>
+
+              {/* 第二行：Trade types */}
+              <div className="flex items-start gap-2">
+                <span className="text-gray-400 min-w-24">Trade types:</span>
+                <Chips items={review.trade_types ?? []} />
+              </div>
+
+              {/* 第三行：Reason codes */}
+              <div className="flex items-start gap-2">
+                <span className="text-gray-400 min-w-24">Reason codes:</span>
+                <Chips items={review.reason_codes ?? []} />
+              </div>
+
+              {/* 备注 */}
+              <div>
+                <div className="text-gray-400 mb-1">Notes</div>
+                <div className="whitespace-pre-wrap rounded-lg border border-gray-700 bg-gray-800/60 p-3 text-gray-100">
+                  {review.notes && review.notes.trim() ? review.notes : "—"}
+                </div>
+              </div>
             </div>
           )}
         </section>

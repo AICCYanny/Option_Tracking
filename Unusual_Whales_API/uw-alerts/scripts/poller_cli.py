@@ -341,7 +341,6 @@ def run_loop(stop_event: threading.Event | None = None):
                                     stock_volume = int(price['volume'])
                                     stock_total_volume = int(price['total_volume'])
                                     otm_pct = _compute_otm_pct(stock_close, g_strike, g_side)
-                                    print(f"  - OTM calc: spot={stock_close}, strike={g_strike}, side={g_side}, otm_pct={otm_pct}")
                                     crud.save_greeks_snapshot(session, 
                                                               alert_id=canonical_id,
                                                               option_symbol=greek.option_symbol,
@@ -357,6 +356,7 @@ def run_loop(stop_event: threading.Event | None = None):
                                                               charm=greek.charm,
                                                               volatility=greek.volatility, 
                                                               otm_pct=otm_pct,
+                                                              expiry=g_expiry,
                                                               data=greeks)
                                     crud.save_price_snapshot(session, 
                                                              alert_id=canonical_id, 
@@ -548,6 +548,13 @@ def main():
                                 try:
                                     greeks = client.fetch_stock_greeks(symbol, expiry=g_expiry)
                                     greek = get_greeks(greeks, g_strike, g_side)
+                                    price = client.fetch_stock_state(symbol)['data']
+                                    stock_market_time = price['market_time']
+                                    stock_close = float(price['close'])
+                                    stock_previous_close = float(price['prev_close'])
+                                    stock_volume = int(price['volume'])
+                                    stock_total_volume = int(price['total_volume'])
+                                    otm_pct = _compute_otm_pct(stock_close, g_strike, g_side)
                                     crud.save_greeks_snapshot(session, 
                                                               alert_id=canonical_id,
                                                               option_symbol=greek.option_symbol,
@@ -562,13 +569,9 @@ def main():
                                                               vanna=greek.vanna,
                                                               charm=greek.charm,
                                                               volatility=greek.volatility, 
+                                                              otm_pct=otm_pct,
+                                                              expiry=g_expiry,
                                                               data=greeks)
-                                    price = client.fetch_stock_state(symbol)['data']
-                                    stock_market_time = price['market_time']
-                                    stock_close = float(price['close'])
-                                    stock_previous_close = float(price['prev_close'])
-                                    stock_volume = int(price['volume'])
-                                    stock_total_volume = int(price['total_volume'])
                                     crud.save_price_snapshot(session, 
                                                              alert_id=canonical_id, 
                                                              market_time=stock_market_time,

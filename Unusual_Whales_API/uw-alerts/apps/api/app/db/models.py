@@ -60,6 +60,7 @@ class MetricsGreeks(Base):
     charm: Mapped[float | None] = mapped_column(Float, nullable=True)
     volatility: Mapped[float | None] = mapped_column(Float, nullable=True)
     otm_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expiry: Mapped[str | None] = mapped_column(String(10), nullable=True)
 
     data_json: Mapped[str] = mapped_column(Text)
 

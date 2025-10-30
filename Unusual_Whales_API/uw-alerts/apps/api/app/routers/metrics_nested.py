@@ -41,6 +41,8 @@ def get_greeks_latest(
             "vega": r.vega,
             "vanna": r.vanna,
             "charm": r.charm,
+            "otm_pct": r.otm_pct,
+            "expiry": r.expiry,
             "data": r.data_json,
         }
 

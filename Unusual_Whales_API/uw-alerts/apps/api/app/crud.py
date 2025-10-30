@@ -102,6 +102,7 @@ def save_greeks_snapshot(session: Session,
                             charm: float,
                             volatility: float,
                             otm_pct: float,
+                            expiry: str,
                             data: dict) -> None:
     raw_str = json.dumps(data, ensure_ascii=False)
     stmt = insert(MetricsGreeks).values(
@@ -120,6 +121,7 @@ def save_greeks_snapshot(session: Session,
         charm=charm,
         volatility=volatility,
         otm_pct=otm_pct,
+        expiry=expiry,
         data_json=raw_str,
     ).on_conflict_do_update(
         index_elements=[MetricsGreeks.alert_id],
@@ -138,6 +140,7 @@ def save_greeks_snapshot(session: Session,
             'charm': charm,
             'volatility': volatility,
             'otm_pct': otm_pct,
+            'expiry': expiry,
             'data_json': raw_str,
         }
     )
